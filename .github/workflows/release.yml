@@ -1,0 +1,47 @@
+name: Package plugin release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build plugin ZIP and GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref }}
+
+      - name: Check PHP syntax
+        run: php -l ctc-website-audit.php
+
+      - name: Build installable plugin ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^[[:space:]]*\* Version:' ctc-website-audit.php | head -n1 | sed -E 's/.*Version:[[:space:]]*//')"
+          mkdir -p dist/ctc-website-audit-pro
+          cp ctc-website-audit.php dist/ctc-website-audit-pro/
+          cd dist
+          zip -r "../ctc-website-audit-pro-${VERSION}.zip" ctc-website-audit-pro
+          echo "PACKAGE=ctc-website-audit-pro-${VERSION}.zip" >> "$GITHUB_ENV"
+          cd ..
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          files: ${{ env.PACKAGE }}
+          generate_release_notes: true
