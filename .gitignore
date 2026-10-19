@@ -1,0 +1,23 @@
+# Local/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+auth.json
+
+# Build/test artifacts
+vendor/
+node_modules/
+coverage/
+.phpunit.cache/
+*.log
+*.zip
