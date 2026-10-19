@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: Existing tag to package
+        description: Existing tag to package (must match the plugin version, e.g. v3.3.13)
         required: true
         type: string
 
@@ -27,21 +27,34 @@ jobs:
       - name: Check PHP syntax
         run: php -l ctc-website-audit.php
 
-      - name: Build installable plugin ZIP
+      - name: Verify tag matches plugin version
         shell: bash
         run: |
           set -euo pipefail
           VERSION="$(grep -E '^[[:space:]]*\* Version:' ctc-website-audit.php | head -n1 | sed -E 's/.*Version:[[:space:]]*//')"
+          if [[ "${GITHUB_REF_NAME}" != "v${VERSION}" && "${{ github.event_name }}" == "push" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match plugin version v${VERSION}."
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.tag_name }}" != "v${VERSION}" ]]; then
+            echo "Selected tag ${{ inputs.tag_name }} does not match plugin version v${VERSION}."
+            exit 1
+          fi
+          echo "PLUGIN_VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build installable plugin ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p dist/ctc-website-audit-pro
           cp ctc-website-audit.php dist/ctc-website-audit-pro/
           cd dist
-          zip -r "../ctc-website-audit-pro-${VERSION}.zip" ctc-website-audit-pro
-          echo "PACKAGE=ctc-website-audit-pro-${VERSION}.zip" >> "$GITHUB_ENV"
+          zip -r "../ctc-website-audit-pro-${PLUGIN_VERSION}.zip" ctc-website-audit-pro
           cd ..
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
-          files: ${{ env.PACKAGE }}
+          files: ctc-website-audit-pro-${{ env.PLUGIN_VERSION }}.zip
           generate_release_notes: true
