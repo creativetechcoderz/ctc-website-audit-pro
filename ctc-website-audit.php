@@ -1042,3 +1042,359 @@ class CTC_Website_Audit {
                 }
 
                 if (empty($p['og_title_present']) || empty($p['og_image_present'])) {
+                    $add('Low', 'Open Graph social preview tags incomplete', 'Page is missing og:title or og:image tags for social sharing previews.', $next);
+                }
+                if (empty($p['twitter_card_present'])) {
+                    $add('Low', 'Twitter Card metadata missing', 'Add twitter:card, twitter:title, and twitter:image for rich snippets on X / Twitter.', $next);
+                }
+
+                // Generic anchor text check
+                if (!empty($p['link_details'])) {
+                    $generic = [];
+                    foreach ($p['link_details'] as $ld) {
+                        $anc = mb_strtolower(trim($ld['anchor'] ?? ''));
+                        if (in_array($anc, ['click here', 'read more', 'learn more', 'here', 'link', 'more'], true)) {
+                            $generic[] = $anc;
+                        }
+                    }
+                    if (count($generic) >= 2) {
+                        $add('Review', 'Generic link anchor text detected', 'Found ' . count($generic) . ' generic anchor(s) like "' . implode('", "', array_slice(array_unique($generic), 0, 3)) . '". Descriptive anchor text improves SEO and accessibility.', $next);
+                    }
+                }
+            }
+
+            // Technical SEO
+            if (in_array('technical', $audits, true)) {
+                if ($p['canonical_missing']) {
+                    $add('Review', 'Canonical link not detected', 'No canonical link tag was found.', $next);
+                }
+                if ($p['canonical_external']) {
+                    $add('High', 'Canonical points to an external domain', 'Canonical href points to: ' . $p['canonical'], $next);
+                }
+                if (!empty($p['header_canonical'])) {
+                    $add('Info', 'HTTP Link Header Canonical detected', 'Canonical declared via HTTP response header: ' . $p['header_canonical'], $next);
+                }
+                if (!empty($p['mixed_content'])) {
+                    $add('High', 'Mixed-content references detected', 'Detected ' . count($p['mixed_content']) . ' insecure HTTP resource(s) on HTTPS.', $next);
+                }
+                if (!$p['viewport_responsive']) {
+                    $add('Review', 'Responsive viewport not detected', 'Page does not declare standard mobile viewport width=device-width.', $next);
+                }
+            }
+
+            // Content Quality
+            if (in_array('content', $audits, true)) {
+                if ($p['word_count'] < 200) {
+                    $add('Review', 'Thin content / low word count (' . $p['word_count'] . ' words)', 'The page contains fewer than 200 words of body text. Ensure primary search intent is well covered.', $next);
+                }
+                if (!$p['breadcrumbs_present']) {
+                    $add('Review', 'Breadcrumb navigation missing', 'No breadcrumb schema or navigation found. Breadcrumbs help bots and users understand site hierarchy.', $next);
+                }
+            }
+
+            // AI Search Readiness (GEO / AEO)
+            if (in_array('ai', $audits, true)) {
+                if ($p['jsonld_invalid'] > 0) {
+                    $add('High', 'Malformed JSON-LD structured data syntax', 'Detected ' . $p['jsonld_invalid'] . ' JSON-LD block(s) with invalid JSON syntax.', $next);
+                } elseif (empty($p['jsonld_blocks'])) {
+                    $add('Review', 'Structured data (JSON-LD) missing', 'No schema JSON-LD blocks found. Machine-readable entities help AI search engines cite your content.', $next);
+                } else {
+                    $add('Info', 'Structured Data Entities: ' . implode(', ', array_slice($p['jsonld_types'], 0, 4)), 'Page declares valid Schema.org entities.', $next);
+                }
+
+                if ($p['question_headings'] === 0) {
+                    $add('Info', 'No question-led headings found (AI Search hint)', 'AI search engines (Perplexity, ChatGPT, AI Overviews) favor FAQ/question-led headers followed by direct answers.', $next);
+                }
+                if (!$p['author_byline_present']) {
+                    $add('Info', 'Author byline / E-E-A-T attribution missing', 'No author byline or Person schema detected. Author attribution strengthens E-E-A-T credibility.', $next);
+                }
+            }
+
+            // Performance: Head scripts
+            if (in_array('speed', $audits, true)) {
+                if ($p['render_blocking_scripts'] > 2) {
+                    $add('Medium', 'Render-blocking scripts in <head>', 'Found ' . $p['render_blocking_scripts'] . ' script(s) in <head> without defer or async attributes.', $next);
+                }
+            }
+        }
+
+        // Bounded Broken Link Checking (Sample max 6 links)
+        if (in_array('technical', $audits, true)) {
+            $destinations = [];
+            foreach ($pages as $pg) {
+                foreach (($pg['link_details'] ?? []) as $ld) {
+                    $dest = $ld['url'];
+                    if (!isset($destinations[$dest])) $destinations[$dest] = $ld;
+                }
+            }
+
+            $checked = 0;
+            foreach ($destinations as $dest => $ld) {
+                if ($checked >= 6) break;
+                $checked++;
+                $st = $this->check_link_status($dest);
+                if (is_wp_error($st)) continue;
+                $code = (int)($st['status'] ?? 0);
+                if ($code === 404 || $code === 410) {
+                    $add('Medium', 'Broken link detected (HTTP ' . $code . ')', 'Destination returned HTTP ' . $code . ': ' . $dest, $ld['source'] ?? $url);
+                } elseif (!empty($st['redirected'])) {
+                    $add('Review', 'Link redirects', 'Destination redirects to: ' . $st['final_url'], $ld['source'] ?? $url);
+                }
+            }
+        }
+
+        // Robots.txt & Sitemap
+        if (in_array('technical', $audits, true)) {
+            $origin = wp_parse_url($url, PHP_URL_SCHEME) . '://' . wp_parse_url($url, PHP_URL_HOST);
+            $robots = $this->fetch_text_resource($origin . '/robots.txt', 50000);
+            if (is_wp_error($robots)) {
+                $add('Review', 'robots.txt could not be fetched', $robots->get_error_message(), $origin . '/robots.txt');
+            } else {
+                $sitemapFound = false;
+                if (preg_match('/^\s*Sitemap:\s*(https?:\/\/\S+)/im', $robots['body'], $sm)) {
+                    $sitemapFound = true;
+                    $add('Info', 'XML Sitemap listed in robots.txt', 'Detected: ' . trim($sm[1]), $origin . '/robots.txt');
+                }
+                if (!$sitemapFound) {
+                    $common = [$origin . '/sitemap_index.xml', $origin . '/wp-sitemap.xml'];
+                    foreach ($common as $candidate) {
+                        $test = $this->fetch_text_resource($candidate, 30000);
+                        if (!is_wp_error($test) && (stripos($test['body'], '<urlset') !== false || stripos($test['body'], '<sitemapindex') !== false)) {
+                            $sitemapFound = true;
+                            $add('Info', 'XML Sitemap detected', 'Detected: ' . $candidate, $candidate);
+                            break;
+                        }
+                    }
+                }
+                if (!$sitemapFound) {
+                    $add('Medium', 'No XML Sitemap detected', 'No sitemap found in robots.txt or standard paths.', $url);
+                }
+            }
+        }
+
+        // Google PageSpeed API (if key is set)
+        $psiKey = get_option(self::OPT_PSI_KEY, '');
+        if (in_array('speed', $audits, true) && !empty($psiKey)) {
+            $api = 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=' . rawurlencode($url) . '&strategy=mobile&category=performance&category=seo&key=' . rawurlencode($psiKey);
+            $pr = $this->safe_remote_get($api, ['timeout' => 6, 'headers' => ['Accept' => 'application/json']]);
+            if (!is_wp_error($pr) && ($pr['response']['code'] ?? 0) === 200) {
+                $j = json_decode($pr['body'], true);
+                $perf = $j['lighthouseResult']['categories']['performance']['score'] ?? null;
+                $auds = $j['lighthouseResult']['audits'] ?? [];
+                $lcp  = $auds['largest-contentful-paint']['displayValue'] ?? 'N/A';
+                $cls  = $auds['cumulative-layout-shift']['displayValue'] ?? 'N/A';
+                $add('Info', 'Google PageSpeed Insights (Mobile)', 'Performance: ' . ($perf !== null ? round($perf * 100) : 'N/A') . '/100. Core Web Vitals: LCP: ' . $lcp . ', CLS: ' . $cls, $url);
+            }
+        }
+
+        // Calculate Scores
+        $weights = ['critical' => 10, 'high' => 5, 'medium' => 2.5, 'low' => 0.5, 'warning' => 1.0, 'review' => 1.0, 'info' => 0];
+        $severityCounts = ['Critical' => 0, 'High' => 0, 'Medium' => 0, 'Low' => 0, 'Review' => 0, 'Warning' => 0, 'Info' => 0];
+        $categoryCounts = [];
+        $rawDeductions = 0;
+        $categoryDeductions = [];
+        $deduped = [];
+        $seenSig = [];
+
+        foreach ($issues as $issue) {
+            $sev = $issue['severity'] ?? 'Info';
+            $cat = $issue['category'] ?? 'General';
+            $sig = md5(strtolower($cat . '|' . $issue['title'] . '|' . ($issue['page'] ?? '')));
+            if (isset($seenSig[$sig])) continue;
+            $seenSig[$sig] = true;
+            unset($issue['_fingerprint']);
+            $deduped[] = $issue;
+
+            $severityCounts[$sev] = ($severityCounts[$sev] ?? 0) + 1;
+            $categoryCounts[$cat] = ($categoryCounts[$cat] ?? 0) + 1;
+            $w = $weights[strtolower($sev)] ?? 0;
+            $rawDeductions += $w;
+            $categoryDeductions[$cat] = ($categoryDeductions[$cat] ?? 0) + $w;
+        }
+
+        $pageCount = max(1, count($pages));
+        $deductions = min(100, $rawDeductions / $pageCount);
+        $finalScore = (int)round(max(0, 100 - $deductions));
+
+        $categoryScores = [];
+        $allCategories = ['Technical SEO & Security', 'On-page SEO & Meta', 'Content Quality', 'AI Search Readiness', 'Local SEO Signals', 'PageSpeed & Core Web Vitals'];
+        foreach ($allCategories as $cName) {
+            $cPen = min(100, ($categoryDeductions[$cName] ?? 0) / $pageCount);
+            $categoryScores[$cName] = round(max(0, 100 - $cPen), 1);
+        }
+
+        $report = [
+            'url'             => $url,
+            'pages_checked'   => count($pages),
+            'pages_attempted' => $scanAttempts,
+            'scan_limit'      => $scanLimit,
+            'pages'           => $pages,
+            'issues'          => $deduped,
+            'score'           => $finalScore,
+            'brand'           => [
+                'name'  => get_option(self::OPT_BRAND_NAME, 'Creative Tech Coderz'),
+                'logo'  => get_option(self::OPT_BRAND_LOGO, 'https://creativetechcoderz.com/wp-content/uploads/2026/10/cropped-creative-tech-coderz-logo-transparent-2.png'),
+                'email' => get_option(self::OPT_CONTACT_EMAIL, get_option('admin_email')),
+            ],
+            'summary'         => array_merge($summary, [
+                'by_severity'     => $severityCounts,
+                'by_category'     => $categoryCounts,
+                'category_scores' => $categoryScores,
+                'score_deductions'=> round($deductions, 2),
+            ]),
+            'generated_at'    => current_time('c'),
+        ];
+
+        // Save History (Max 15 items, lightweight)
+        $history = get_option(self::OPT_SCAN_HISTORY, []);
+        if (!is_array($history)) $history = [];
+        array_unshift($history, [
+            'date'   => current_time('mysql'),
+            'url'    => $url,
+            'pages'  => count($pages),
+            'score'  => $finalScore,
+            'issues' => count($deduped),
+        ]);
+        update_option(self::OPT_SCAN_HISTORY, array_slice($history, 0, 15), false);
+
+        return $report;
+    }
+
+    public function submit_large_audit_request($req) {
+        $name     = sanitize_text_field((string)$req->get_param('name'));
+        $email    = sanitize_email((string)$req->get_param('email'));
+        $url      = esc_url_raw(trim((string)$req->get_param('url')));
+        $honeypot = trim((string)$req->get_param('company'));
+
+        if ($honeypot !== '') {
+            return rest_ensure_response(['submitted' => true, 'message' => 'Thank you. Your request has been received.']);
+        }
+        if ($name === '' || !is_email($email) || !$url || !wp_http_validate_url($url)) {
+            return new WP_Error('invalid_request', 'Please provide a valid name, email address, and public website URL.', ['status' => 400]);
+        }
+
+        $to      = get_option(self::OPT_CONTACT_EMAIL, get_option('admin_email'));
+        $subject = 'New Audit Request (21–500 pages): ' . $url;
+        $message = "New large website audit request received:\n\nName: {$name}\nEmail: {$email}\nWebsite: {$url}\nSubmitted: " . current_time('mysql');
+        $headers = ['Reply-To: ' . $name . ' <' . $email . '>'];
+
+        wp_mail($to, $subject, $message, $headers);
+        wp_mail($email, 'Audit Request Received - ' . get_option(self::OPT_BRAND_NAME, 'Creative Tech Coderz'), "Hello {$name},\n\nWe have received your audit request for {$url}. Our team will review and follow up shortly.\n\nBest regards,\n" . get_option(self::OPT_BRAND_NAME, 'Creative Tech Coderz'));
+
+        return rest_ensure_response(['submitted' => true, 'message' => 'Your request was received successfully! We will follow up via email.']);
+    }
+
+    public function shortcode() {
+        $initEndpoint     = esc_url(rest_url('ctc-audit/v1/scan/init'));
+        $batchEndpoint    = esc_url(rest_url('ctc-audit/v1/scan/batch'));
+        $finalizeEndpoint = esc_url(rest_url('ctc-audit/v1/scan/finalize'));
+        $largeEndpoint    = esc_url(rest_url('ctc-audit/v1/large-audit-request'));
+        $restNonce        = wp_create_nonce('wp_rest');
+
+        ob_start(); ?>
+        <style>
+        .ctca { max-width: 1100px; margin: 30px auto; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+        .ctca-hero { background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%); color: #fff; border-radius: 18px; padding: clamp(24px, 4vw, 42px); margin-bottom: 24px; box-shadow: 0 12px 35px rgba(15, 23, 42, 0.12); }
+        .ctca-hero h2 { color: #fff; font-size: clamp(24px, 3.5vw, 36px); line-height: 1.25; margin: 0 0 10px; font-weight: 800; }
+        .ctca-hero p { color: #cbd5e1; max-width: 720px; font-size: 15px; margin: 0; line-height: 1.6; }
+        .ctca-form, .ctca-results { background: #fff; border: 1px solid #e2e8f0; border-radius: 18px; padding: clamp(20px, 3.5vw, 36px); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.05); }
+        .ctca label { font-weight: 600; display: block; margin-bottom: 7px; color: #1e293b; font-size: 14px; }
+        .ctca input[type=url], .ctca select, .ctca input[type=text], .ctca input[type=email] { width: 100%; box-sizing: border-box; padding: 13px 16px; border: 1px solid #cbd5e1; border-radius: 10px; font-size: 15px; color: #0f172a; background: #fff; transition: border-color .15s, box-shadow .15s; }
+        .ctca input[type=url]:focus, .ctca select:focus, .ctca input[type=text]:focus, .ctca input[type=email]:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15); }
+        .ctca-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 18px 0; }
+        .ctca-option { border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px; display: flex; gap: 10px; align-items: center; background: #f8fafc; cursor: pointer; font-size: 14px; font-weight: 500; transition: border-color .15s, background .15s; }
+        .ctca-option:hover { background: #f1f5f9; border-color: #cbd5e1; }
+        .ctca-option input[type=checkbox] { width: 17px; height: 17px; accent-color: #2563eb; cursor: pointer; }
+        .ctca button.ctca-btn { background: #2563eb; color: #fff; border: 0; border-radius: 10px; padding: 13px 26px; font-weight: 700; font-size: 15px; cursor: pointer; transition: background .15s, transform .1s; display: inline-flex; align-items: center; gap: 8px; }
+        .ctca button.ctca-btn:hover { background: #1d4ed8; }
+        .ctca button.ctca-btn:disabled { opacity: .65; cursor: wait; }
+        .ctca .ctca-results > div[style*="border-top"] {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: stretch;
+            gap: 10px;
+        }
+        .ctca .ctca-results > div[style*="border-top"] .ctca-btn {
+            box-sizing: border-box;
+            max-width: 100%;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }
+        @media (max-width: 600px) {
+            .ctca .ctca-results > div[style*="border-top"] {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .ctca .ctca-results > div[style*="border-top"] .ctca-btn {
+                width: 100%;
+                min-width: 0;
+                margin: 0;
+                text-align: center;
+            }
+        }
+        .ctca-muted { color: #64748b; font-size: 13px; line-height: 1.5; margin: 8px 0; }
+        
+        /* Progress Bar */
+        .ctca-progress-box { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 14px; padding: 20px; margin-top: 18px; }
+        .ctca-progress-bar { height: 10px; background: #e2e8f0; border-radius: 6px; overflow: hidden; margin-top: 10px; }
+        .ctca-progress-fill { height: 100%; width: 0%; background: #2563eb; transition: width 0.3s ease; }
+
+        /* Modern Result Cards */
+        .ctca-result-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 18px 0; }
+        .ctca-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 16px 18px; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03); }
+        .ctca-card strong { display: block; font-size: 26px; margin: 6px 0 2px; color: #0f172a; font-weight: 800; }
+        
+        /* Interactive Category Cards / Pills */
+        .ctca-cat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin: 18px 0; }
+        .ctca-cat-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 16px 18px; cursor: pointer; text-align: left; transition: all .18s ease; outline: none; position: relative; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03); }
+        .ctca-cat-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08); border-color: #cbd5e1; }
+        .ctca-cat-card.active { border-color: #2563eb !important; background: #f8fafc !important; box-shadow: 0 0 0 2px #2563eb, 0 8px 20px rgba(37, 99, 235, 0.12) !important; }
+        .ctca-cat-card .ctca-cat-name { font-size: 13px; font-weight: 700; color: #475569; display: block; }
+        .ctca-cat-card strong { display: block; font-size: 22px; margin: 6px 0 3px; color: #0f172a; font-weight: 800; }
+        .ctca-cat-card .ctca-cat-sub { font-size: 12px; color: #64748b; display: block; }
+        .ctca-cat-badge { position: absolute; top: 14px; right: 14px; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 20px; background: #e2e8f0; color: #334155; }
+        .ctca-cat-card.active .ctca-cat-badge { background: #2563eb; color: #fff; }
+
+        /* Finding Item Cards */
+        .ctca-issue { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 20px; margin: 14px 0; box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04); transition: border-color .15s; }
+        .ctca-issue:hover { border-color: #cbd5e1; }
+        .ctca-badge { display: inline-block; border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; margin-right: 8px; }
+        .ctca-issue[data-severity="Critical"] .ctca-badge, .ctca-issue[data-severity="High"] .ctca-badge { background: #fee2e2; color: #b91c1c; }
+        .ctca-issue[data-severity="Medium"] .ctca-badge, .ctca-issue[data-severity="Warning"] .ctca-badge { background: #fef3c7; color: #b45309; }
+        .ctca-issue[data-severity="Low"] .ctca-badge, .ctca-issue[data-severity="Info"] .ctca-badge { background: #dcfce7; color: #15803d; }
+        .ctca-issue[data-severity="Review"] .ctca-badge { background: #e0f2fe; color: #0369a1; }
+        
+        .ctca-recommendation-box { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 12px 16px; margin: 12px 0 8px; font-size: 14px; color: #166534; line-height: 1.5; }
+        .ctca-suggestion-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 16px; margin: 10px 0 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: #0f172a; position: relative; overflow-x: auto; }
+        .ctca-copy-btn { float: right; background: #334155; color: #fff; border: 0; border-radius: 6px; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer; margin-left: 8px; }
+        .ctca-copy-btn:hover { background: #1e293b; }
+        
+        /* Print & PDF */
+        .ctca-print-brand { display: none; }
+        @media print {
+            body * { visibility: hidden; }
+            .ctca-results, .ctca-results * { visibility: visible; }
+            .ctca-results { position: absolute; left: 0; top: 0; width: 100%; border: 0; box-shadow: none; padding: 0; }
+            .ctca-hero, .ctca-form, .ctca-filters, button, .ctca-cat-grid { display: none !important; }
+            .ctca-print-brand { display: flex !important; align-items: center; gap: 16px; border-bottom: 2px solid #2563eb; padding-bottom: 12px; margin-bottom: 16px; }
+            .ctca-print-brand img { max-height: 48px; }
+            .ctca-issue { break-inside: avoid; page-break-inside: avoid; }
+        }
+        </style>
+
+        <div class="ctca">
+            <section class="ctca-hero">
+                <p style="color:#60a5fa;font-weight:700;text-transform:uppercase;margin:0 0 6px;font-size:12px;letter-spacing:0.05em;">Professional SEO & Technical Health Checker</p>
+                <h2>Find the issues holding your website back.</h2>
+                <p>Scan key pages for technical SEO, security headers, on-page structure, image optimization, broken links, AI search readiness, and mobile responsiveness.</p>
+            </section>
+
+            <form class="ctca-form" id="ctca-form">
+                <label for="ctca-url">Target Website URL</label>
+                <input id="ctca-url" type="url" placeholder="https://example.com" required>
+                <p class="ctca-muted">Enter any public HTTP or HTTPS website URL you wish to audit.</p>
+
+                <label for="ctca-scan-limit" style="margin-top:16px;">Pages to audit</label>
+                <select id="ctca-scan-limit">
+                    <option value="1">Single page — 1 page</option>
+                    <option value="5" selected>Fast scan — 5 pages</option>
