@@ -1,1400 +1,307 @@
 <?php
 /**
  * Plugin Name: CTC Website Audit Pro
- * Description: High-performance, secure website audit tool by Creative Tech Coderz. Features progressive batch crawling, SSRF protection, strict TLS verification, technical SEO, on-page structure, security headers, schema validation, CSV export, and branded print/PDF reports.
- * Version: 3.8.1
+ * Description: Website audit tool by Creative Tech Coderz with technical SEO checks, actionable recommendations, CSV export and branded print/PDF reports. Optional Google PageSpeed Insights API integration.
+ * Version: 3.3.13
  * Author: Creative Tech Coderz
- * Author URI: https://creativetechcoderz.com
  * Requires at least: 6.2
  * Requires PHP: 7.4
- * Text Domain: ctc-website-audit
  */
-
-if (!defined('ABSPATH')) {
-    exit;
-}
-
-if (defined('CTC_WEBSITE_AUDIT_PRO_LOADED')) {
-    return;
-}
+if (!defined('ABSPATH')) exit;
+// Prevent duplicate active copies from registering duplicate hooks in the same request.
+if (defined('CTC_WEBSITE_AUDIT_PRO_LOADED')) return;
 define('CTC_WEBSITE_AUDIT_PRO_LOADED', true);
-define('CTC_AUDIT_VERSION', '3.8.1');
-
 class CTC_Website_Audit {
-
-    const OPT_PSI_KEY         = 'ctc_website_audit_psi_key';
-    const OPT_MONITOR_ENABLED = 'ctc_website_audit_monitor_enabled';
-    const OPT_MONITOR_STATE   = 'ctc_website_audit_monitor_state';
-    const OPT_BRAND_NAME      = 'ctc_website_audit_brand_name';
-    const OPT_BRAND_LOGO      = 'ctc_website_audit_brand_logo';
-    const OPT_CONTACT_EMAIL   = 'ctc_website_audit_contact_email';
-    const OPT_SCAN_HISTORY    = 'ctc_website_audit_history';
-    const OPT_CHANGE_LOG      = 'ctc_website_audit_change_log';
-
-    public function __construct() {
-        add_shortcode('ctc_website_audit', [$this, 'shortcode']);
-
-        add_action('rest_api_init', function() {
-            // Progressive Batch Endpoints (Zero Gateway Timeout)
-            register_rest_route('ctc-audit/v1', '/scan/init', [
-                'methods'             => 'POST',
-                'callback'            => [$this, 'scan_init'],
-                'permission_callback' => '__return_true',
-                'args'                => [
-                    'url'        => ['required' => true, 'type' => 'string'],
-                    'audits'     => ['required' => false, 'type' => 'array'],
-                    'scan_limit' => ['required' => false, 'type' => 'integer'],
-                ],
-            ]);
-
-            register_rest_route('ctc-audit/v1', '/scan/batch', [
-                'methods'             => 'POST',
-                'callback'            => [$this, 'scan_batch'],
-                'permission_callback' => '__return_true',
-                'args'                => [
-                    'session_id' => ['required' => true, 'type' => 'string'],
-                ],
-            ]);
-
-            register_rest_route('ctc-audit/v1', '/scan/finalize', [
-                'methods'             => 'POST',
-                'callback'            => [$this, 'scan_finalize'],
-                'permission_callback' => '__return_true',
-                'args'                => [
-                    'session_id' => ['required' => true, 'type' => 'string'],
-                ],
-            ]);
-
-            // Legacy direct endpoint (Used by WP-Cron daily monitor)
-            register_rest_route('ctc-audit/v1', '/scan', [
-                'methods'             => 'POST',
-                'callback'            => [$this, 'scan_legacy'],
-                'permission_callback' => '__return_true',
-                'args'                => [
-                    'url'        => ['required' => true, 'type' => 'string'],
-                    'audits'     => ['required' => false, 'type' => 'array'],
-                    'scan_limit' => ['required' => false, 'type' => 'integer'],
-                ],
-            ]);
-
-            // Enterprise Large Audit Inquiries (21-500 pages)
-            register_rest_route('ctc-audit/v1', '/large-audit-request', [
-                'methods'             => 'POST',
-                'callback'            => [$this, 'submit_large_audit_request'],
-                'permission_callback' => '__return_true',
-            ]);
-        });
-
-        add_action('admin_menu', [$this, 'add_admin_menu']);
-        add_action('admin_init', [$this, 'register_settings']);
-
-        add_filter('cron_schedules', function($s) {
-            $s['ctca_daily'] = ['interval' => DAY_IN_SECONDS, 'display' => 'Once daily'];
-            return $s;
-        });
-
-        add_action('ctca_daily_monitor', [$this, 'scheduled_monitor']);
+  const OPT = 'ctc_website_audit_psi_key';
+  const MONITOR_OPT = 'ctc_website_audit_monitor_enabled';
+  const MONITOR_STATE_OPT = 'ctc_website_audit_monitor_state';
+  private $is_scheduled_run = false;
+  public function __construct() {
+    add_shortcode('ctc_website_audit', [$this,'shortcode']);
+    add_action('rest_api_init', function(){ register_rest_route('ctc-audit/v1','/scan',[ 'methods'=>'POST','callback'=>[$this,'scan'],'permission_callback'=>'__return_true','args'=>['url'=>['required'=>true,'type'=>'string'],'audits'=>['required'=>false,'type'=>'array'],'scan_limit'=>['required'=>false,'type'=>'integer']] ]); });
+    add_action('rest_api_init', function(){ register_rest_route('ctc-audit/v1','/large-audit-request',[ 'methods'=>'POST','callback'=>[$this,'submit_large_audit_request'],'permission_callback'=>'__return_true' ]); });
+    add_action('admin_menu', function(){ add_menu_page('CTC Website Audit Pro','CTC Website Audit Pro','manage_options','ctc-website-audit',[$this,'settings'],'dashicons-search',58); });
+    add_action('admin_init', function(){ register_setting('ctc_audit_group',self::OPT,['type'=>'string','sanitize_callback'=>'sanitize_text_field','default'=>'']); register_setting('ctc_audit_group',self::MONITOR_OPT,['type'=>'boolean','sanitize_callback'=>function($v){return (bool)$v;},'default'=>false]); });
+    add_filter('cron_schedules',function($s){$s['ctca_daily']=['interval'=>DAY_IN_SECONDS,'display'=>'Once daily'];return $s;});
+    add_action('ctca_daily_monitor',[$this,'scheduled_monitor']);
+    add_action('init',[$this,'sync_monitor_schedule']);
+    add_action('rest_api_init',function(){register_rest_route('ctc-audit/v1','/apply-approved-fix',['methods'=>'POST','callback'=>[$this,'apply_approved_fix'],'permission_callback'=>function(){return current_user_can('edit_pages') && wp_verify_nonce((string)($_SERVER['HTTP_X_WP_NONCE']??''),'wp_rest');}]);register_rest_route('ctc-audit/v1','/rollback-approved-fix',['methods'=>'POST','callback'=>[$this,'rollback_approved_fix'],'permission_callback'=>function(){return current_user_can('edit_pages') && wp_verify_nonce((string)($_SERVER['HTTP_X_WP_NONCE']??''),'wp_rest');}]);});
+  }
+  public function submit_large_audit_request($req){
+    $name=sanitize_text_field((string)$req->get_param('name'));
+    $email=sanitize_email((string)$req->get_param('email'));
+    $url=esc_url_raw(trim((string)$req->get_param('url')));
+    $audits=$req->get_param('audits');
+    $honeypot=trim((string)$req->get_param('company'));
+    if($honeypot!=='') return rest_ensure_response(['submitted'=>true,'message'=>'Thank you. Your request has been received.']);
+    if($name==='' || !is_email($email) || !$url || !wp_http_validate_url($url)) return new WP_Error('invalid_request','Please provide a name, valid email address, and valid public website URL.',['status'=>400]);
+    if(!$req->get_param('authorization')) return new WP_Error('authorization_required','Please confirm that you own the website or have permission to request its audit.',['status'=>400]);
+    if(!$req->get_param('privacy_ack')) return new WP_Error('privacy_ack_required','Please confirm that you have read the Privacy Policy and Terms of Use.',['status'=>400]);
+    $host=parse_url($url,PHP_URL_HOST);
+    if(!$host || !in_array(strtolower((string)parse_url($url,PHP_URL_SCHEME)),['http','https'],true)) return new WP_Error('invalid_url','Please enter a valid HTTP or HTTPS website URL.',['status'=>400]);
+    $ip=(string)($_SERVER['REMOTE_ADDR']??'unknown');
+    $rate_key='ctca_large_req_'.md5($ip);
+    $count=(int)get_transient($rate_key);
+    if($count>=5) return new WP_Error('rate_limited','Too many requests from this connection. Please try again later.',['status'=>429]);
+    set_transient($rate_key,$count+1,15*MINUTE_IN_SECONDS);
+    if(!is_array($audits)) $audits=[];
+    $allowed=['technical','onpage','ai','local','content','speed'];
+    $audits=array_values(array_intersect(array_map('sanitize_key',$audits),$allowed));
+    $audit_labels=['technical'=>'Technical SEO','onpage'=>'On-page SEO','ai'=>'AI SEO / GEO / AEO readiness','local'=>'Local SEO signals','content'=>'Content quality signals','speed'=>'Website speed'];
+    $labels=array_map(function($key)use($audit_labels){return $audit_labels[$key]??$key;},$audits);
+    $to=get_option('admin_email');
+    $subject='Larger Website Audit Request (101–500 pages)';
+    $message="A larger website audit request was submitted from the CTC Website Audit page.\n\nName: {$name}\nEmail: {$email}\nWebsite: {$url}\nRequested page range: 101–500 pages\nAudit areas: ".($labels?implode(', ',$labels):'Not specified')."\nSubmitted: ".current_time('mysql')."\n\nPlease follow up with the requester.\n";
+    $headers=['Reply-To: '.$name.' <'.$email.'>','Content-Type: text/plain; charset=UTF-8'];
+    $sent=wp_mail($to,$subject,$message,$headers);
+    if(!$sent) return new WP_Error('email_failed','We could not submit your request right now. Please try again later or contact creativetechcoderz@gmail.com.',['status'=>500]);
+    wp_mail($email,'We received your larger website audit request',"Hello {$name},\n\nThank you for contacting Creative Tech Coderz. We received your request for a larger website audit. Our team will review the details and follow up by email.\n\nWebsite: {$url}\nRequested page range: 101–500 pages\n\nRegards,\nCreative Tech Coderz",['Content-Type: text/plain; charset=UTF-8']);
+    return rest_ensure_response(['submitted'=>true,'message'=>'Your request has been submitted successfully. Our team will contact you by email.']);
+  }
+  public function sync_monitor_schedule(){
+    if(get_option(self::MONITOR_OPT,false)){
+      if(!wp_next_scheduled('ctca_daily_monitor')) wp_schedule_event(time()+300,'ctca_daily','ctca_daily_monitor');
+    } else {
+      // Clear every queued copy so disabling monitoring actually stops future runs.
+      wp_clear_scheduled_hook('ctca_daily_monitor');
     }
-
-    public static function on_activate() {
-        if (!wp_next_scheduled('ctca_daily_monitor')) {
-            wp_schedule_event(time() + DAY_IN_SECONDS, 'ctca_daily', 'ctca_daily_monitor');
-        }
+  }
+  private function save_monitor_state($state,$message=''){
+    $old=get_option(self::MONITOR_STATE_OPT,[]); if(!is_array($old))$old=[];
+    $old['status']=$state; $old['updated_at']=current_time('mysql');
+    if($message!=='')$old['message']=sanitize_text_field((string)$message);
+    update_option(self::MONITOR_STATE_OPT,$old,false);
+  }
+  public function scheduled_monitor(){
+    if(!get_option(self::MONITOR_OPT,false)) { $this->save_monitor_state('disabled','Monitoring is disabled in settings.'); return; }
+    $this->save_monitor_state('running','Scheduled homepage audit is running.');
+    $url=home_url('/'); $req=new WP_REST_Request('POST','/ctc-audit/v1/scan');
+    $req->set_param('url',$url); $req->set_param('audits',['technical','onpage','ai','local','content','speed']);
+    // This private instance flag cannot be set by an external REST request.
+    $this->is_scheduled_run=true;
+    try {
+      $result=$this->scan($req);
+      if(is_wp_error($result)) { $this->save_monitor_state('failed',$result->get_error_message()); return; }
+      if($result instanceof WP_REST_Response && $result->get_status()>=400) { $this->save_monitor_state('failed','Scan returned HTTP '.$result->get_status()); return; }
+      $this->save_monitor_state('success','Scheduled audit completed.');
+    } catch (Throwable $e) {
+      $this->save_monitor_state('failed','Scheduled audit exception: '.$e->getMessage());
+    } finally { $this->is_scheduled_run=false; }
+  }
+  public function apply_approved_fix($req){ $post_id=absint($req->get_param('post_id'));$field=sanitize_key((string)$req->get_param('field'));$value=(string)$req->get_param('value');if(!$post_id||!current_user_can('edit_post',$post_id))return new WP_Error('forbidden','You cannot edit this page.',['status'=>403]);$allowed=['post_title','post_excerpt'];if(!in_array($field,$allowed,true))return new WP_Error('unsupported_field','Only page title and excerpt can be changed by this beta. SEO-plugin metadata and body content are not automatically modified.',['status'=>400]);$post=get_post($post_id);if(!$post||$post->post_status==='trash')return new WP_Error('not_found','Page not found.',['status'=>404]);$before=$field==='post_title'?$post->post_title:$post->post_excerpt;$updated=wp_update_post(['ID'=>$post_id,$field=>sanitize_text_field($value)],true);if(is_wp_error($updated))return $updated;$log=get_option('ctc_website_audit_change_log',[]);array_unshift($log,['date'=>current_time('mysql'),'post_id'=>$post_id,'field'=>$field,'before'=>$before,'after'=>sanitize_text_field($value),'user'=>get_current_user_id()]);update_option('ctc_website_audit_change_log',array_slice($log,0,100),false);return rest_ensure_response(['updated'=>true,'post_id'=>$post_id,'field'=>$field,'before'=>$before,'after'=>sanitize_text_field($value),'note'=>'Change logged. WordPress revisions may allow rollback where supported.']); }
+  public function rollback_approved_fix($req){
+    $post_id=absint($req->get_param('post_id'));$field=sanitize_key((string)$req->get_param('field'));
+    if(!$post_id||!current_user_can('edit_post',$post_id))return new WP_Error('forbidden','You cannot edit this page.',['status'=>403]);
+    $allowed=['post_title','post_excerpt'];if(!in_array($field,$allowed,true))return new WP_Error('unsupported_field','Only post_title and post_excerpt can be rolled back by this beta.',['status'=>400]);
+    $log=get_option('ctc_website_audit_change_log',[]);if(!is_array($log))$log=[];$targetIndex=null;
+    foreach($log as $i=>$entry){if((int)($entry['post_id']??0)===$post_id&&($entry['field']??'')===$field&&empty($entry['rolled_back'])){$targetIndex=$i;break;}}
+    if($targetIndex===null)return new WP_Error('no_change','No eligible change-log entry was found for this page and field.',['status'=>404]);
+    $entry=$log[$targetIndex];$post=get_post($post_id);if(!$post)return new WP_Error('not_found','Page not found.',['status'=>404]);
+    $current=$field==='post_title'?$post->post_title:$post->post_excerpt;
+    if((string)$current!==(string)($entry['after']??''))return new WP_Error('changed_since','Current value differs from the logged value. Refusing rollback to avoid overwriting a newer edit.',['status'=>409]);
+    $before=(string)($entry['before']??'');$updated=wp_update_post(['ID'=>$post_id,$field=>($field==='post_title'?sanitize_text_field($before):sanitize_textarea_field($before))],true);if(is_wp_error($updated))return $updated;
+    $log[$targetIndex]['rolled_back']=current_time('mysql');$log[$targetIndex]['rolled_back_by']=get_current_user_id();array_unshift($log,['date'=>current_time('mysql'),'post_id'=>$post_id,'field'=>$field,'before'=>$current,'after'=>$before,'user'=>get_current_user_id(),'action'=>'rollback']);update_option('ctc_website_audit_change_log',array_slice($log,0,100),false);
+    return rest_ensure_response(['rolled_back'=>true,'post_id'=>$post_id,'field'=>$field,'before'=>$current,'after'=>$before]);
+  }
+  public function settings(){ if(!current_user_can('manage_options')) return; $history=get_option('ctc_website_audit_history',[]); if(!is_array($history))$history=[]; echo '<div class="wrap"><h1>CTC Website Audit Pro</h1><p>Version 3.3.13 · By Creative Tech Coderz. Automated checks and recommendations require review; results are not guarantees.</p><form method="post" action="options.php">'; settings_fields('ctc_audit_group'); echo '<h2>Integrations</h2><div style="max-width:760px;padding:16px;margin:12px 0 20px;background:#f6fbf8;border-left:4px solid #16845b;border-radius:4px"><label for="ctc-psi-api-key"><strong>Google PageSpeed Insights API key (optional)</strong></label><p class="description" id="ctc-psi-api-key-help">Add a key to include Google PageSpeed Insights Lighthouse performance and SEO results for mobile and desktop in audits. Leave this blank to skip PageSpeed checks; the other audit checks will still work.</p><input id="ctc-psi-api-key" type="password" name="'.esc_attr(self::OPT).'" value="'.esc_attr(get_option(self::OPT,'')).'" class="regular-text" autocomplete="new-password" aria-describedby="ctc-psi-api-key-help" placeholder="Paste API key (optional)"><p class="description">Get a key in <a href="https://console.cloud.google.com/apis/library/pagespeedonline.googleapis.com" target="_blank" rel="noopener noreferrer">Google Cloud Console</a>. Enable the PageSpeed Insights API and check your key restrictions and quota. Save settings after entering the key.</p></div><p><input type="hidden" name="'.esc_attr(self::MONITOR_OPT).'" value="0"><label><input type="checkbox" name="'.esc_attr(self::MONITOR_OPT).'" value="1" '.checked((bool)get_option(self::MONITOR_OPT,false),true,false).'> Enable daily homepage monitoring (uses WordPress Cron; site traffic may affect timing)</label></p>'; $monitorState=get_option(self::MONITOR_STATE_OPT,[]); if(is_array($monitorState)&&!empty($monitorState['status'])) echo '<p><strong>Monitoring status:</strong> '.esc_html($monitorState['status']).' · '.esc_html($monitorState['updated_at']??'').' — '.esc_html($monitorState['message']??'').(!empty($monitorState['last_alert_status'])?' · Last alert: '.esc_html($monitorState['last_alert_status']).' ('.esc_html($monitorState['last_alert_at']??'').')':'').'</p>'; submit_button('Save Settings'); echo '</form><h2>Recent scan history</h2>'; if(!$history) echo '<p>No saved scans yet. Run an audit using the shortcode.</p>'; else { echo '<table class="widefat striped"><thead><tr><th>Date</th><th>Website</th><th>Pages</th><th>Score</th><th>Findings</th><th>Change vs previous scan</th></tr></thead><tbody>'; $previous=[]; foreach(array_slice($history,0,20) as $h){$host=(string)($h['url']??'');$prev=$previous[$host]??null;$delta=$prev===null?'—':(($h['score']??0)-($prev['score']??0));$change=$prev===null?'First saved scan':(($delta>0?'+':'').$delta.' score points; '.((int)($h['issues']??0)-(int)($prev['issues']??0)).' finding difference');echo '<tr><td>'.esc_html($h['date']??'').'</td><td><a href="'.esc_url($host?:'#').'" target="_blank" rel="noopener">'.esc_html($host).'</a></td><td>'.intval($h['pages']??0).'</td><td>'.intval($h['score']??0).'/100</td><td>'.intval($h['issues']??0).'</td><td>'.esc_html($change).'</td></tr>';if(!isset($previous[$host]))$previous[$host]=$h;} echo '</tbody></table>'; } $log=get_option('ctc_website_audit_change_log',[]);echo '<h2>Approved fix change log</h2>';if(!$log)echo '<p>No approved fixes have been applied through the audit API.</p>';else{echo '<table class="widefat striped"><thead><tr><th>Date</th><th>Post ID</th><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>';foreach(array_slice($log,0,20) as $l)echo '<tr><td>'.esc_html($l['date']??'').'</td><td>'.intval($l['post_id']??0).'</td><td>'.esc_html($l['field']??'').'</td><td>'.esc_html($l['before']??'').'</td><td>'.esc_html($l['after']??'').'</td></tr>';echo '</tbody></table>';} echo '<p>Shortcode: <code>[ctc_website_audit]</code>. Monitoring scans the homepage daily and emails the site administrator when new high-priority findings are detected. WordPress Cron timing depends on site traffic. The approved-fix endpoint supports WordPress page title and excerpt only. Recommendations are generated locally from built-in rules; no OpenAI API key, paid AI service or AI API calls are required. No fixes are applied automatically. Complete JavaScript crawling, Search Console/GBP integrations and a dedicated PDF renderer are not included.</p></div>'; }
+  public function shortcode(){
+    $endpoint=esc_url(rest_url('ctc-audit/v1/scan')); $largeRequestEndpoint=esc_url(rest_url('ctc-audit/v1/large-audit-request')); $restNonce=wp_create_nonce('wp_rest'); $privacyUrl=esc_url(home_url('/privacy-policy/')); $termsUrl=esc_url(home_url('/terms-of-service/'));
+    ob_start(); ?>
+    <style>.ctca{max-width:1080px;margin:24px auto;color:#17243b;font-family:inherit}.ctca-hero{background:linear-gradient(125deg,#101f3e,#174c79);color:#fff;border-radius:22px;padding:clamp(24px,5vw,52px);margin-bottom:24px}.ctca-hero h2{color:#fff;font-size:clamp(28px,4vw,42px);line-height:1.12;margin:0 0 12px}.ctca-hero p{color:#e4edf8;max-width:720px}.ctca-form,.ctca-results{background:#fff;border:1px solid #dce4ee;border-radius:18px;padding:clamp(18px,3vw,30px);box-shadow:0 12px 36px rgba(16,31,62,.07)}.ctca label{font-weight:600;display:block;margin-bottom:7px}.ctca input[type=url]{width:100%;box-sizing:border-box;padding:14px;border:1px solid #cbd5e1;border-radius:10px;font-size:16px}.ctca-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:18px 0}.ctca-option{border:1px solid #dce4ee;border-radius:10px;padding:12px;display:flex;gap:9px;align-items:flex-start;font-weight:500!important}.ctca button{background:#0c6ac5;color:white;border:0;border-radius:10px;padding:14px 22px;font-weight:700;cursor:pointer}.ctca button:disabled{opacity:.6;cursor:wait}.ctca-muted{color:#64748b;font-size:14px}.ctca-result-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:18px 0}.ctca-card{background:#f6f9fc;border:1px solid #e1e8f0;border-radius:12px;padding:15px}.ctca-card strong{display:block;font-size:24px;margin:6px 0}.ctca-issue{position:relative;margin:16px 0;padding:22px 24px 20px;border:1px solid #dce5ef;border-radius:16px;background:#fff;box-shadow:0 5px 18px rgba(15,35,65,.045);overflow-wrap:anywhere;word-break:break-word;break-inside:avoid}.ctca-issue:nth-child(even){background:#fff}.ctca-issue>strong{display:inline-block;color:#142b4a;font-size:19px;line-height:1.4;margin:8px 0 4px}.ctca-issue>p{font-size:15px;line-height:1.75;color:#334155;margin:12px 0}.ctca-issue>p.ctca-muted{font-size:13px;color:#64748b}.ctca-results{min-width:0;overflow-wrap:anywhere}.ctca-results a{overflow-wrap:anywhere}.ctca-issue:last-child{border:1px solid #dce5ef}.ctca-suggestion{background:#f5f9ff;border:1px solid #d7e6f8;border-radius:12px;padding:17px 18px;margin:16px 0}.ctca-suggestion>strong{display:block;color:#183b63;font-size:16px;margin-bottom:6px}.ctca-suggestion p{font-size:15px;line-height:1.7;color:#263b54}.ctca-suggestion button{padding:9px 14px;font-size:13px}.ctca-badge{display:inline-block;border-radius:6px;background:#fff0d6;color:#8b5100;padding:5px 10px;font-size:11px;letter-spacing:.035em;text-transform:uppercase;font-weight:800;vertical-align:middle}.ctca-issue[data-severity="High"] .ctca-badge,.ctca-issue[data-severity="Critical"] .ctca-badge{background:#fee8e7;color:#a32621}.ctca-issue[data-severity="Medium"] .ctca-badge{background:#fff1d6;color:#8b5100}.ctca-issue[data-severity="Low"] .ctca-badge,.ctca-issue[data-severity="Info"] .ctca-badge{background:#e8f4ed;color:#17643a}.ctca-issue[data-severity="Review"] .ctca-badge{background:#eaf1fb;color:#315b91}.ctca-results>h2{font-size:30px;letter-spacing:-.025em;color:#102746;margin:0 0 8px}.ctca-results>h3{font-size:21px;color:#183b63;margin:28px 0 12px;padding-bottom:9px;border-bottom:1px solid #e5ebf2}.ctca-results>p{line-height:1.7}.ctca-results .ctca-card{background:linear-gradient(180deg,#fff,#f8fafc);border-color:#dce5ef;box-shadow:0 4px 14px rgba(15,35,65,.035)}.ctca-results .ctca-card strong{color:#173b65}.ctca-results .ctca-free-recommendations{padding:18px 20px;background:#f5f9ff;border:1px solid #d9e8f8;border-radius:14px;margin:22px 0}.ctca-results .ctca-free-recommendations h3{border:0;margin:0 0 6px;padding:0}.ctca-results .ctca-issue[hidden]{display:none}.ctca #ctca-table-wrap[hidden],.ctca #ctca-findings-list[hidden],.ctca .ctca-results[hidden]{display:none!important}.ctca-table-scroll{width:100%;max-width:100%;overflow-x:auto;margin:14px 0;border:1px solid #dbe4ee;border-radius:10px;-webkit-overflow-scrolling:touch}/* Explicitly override theme/table styles that were collapsing the report columns. */.ctca .ctca-table-scroll:not([hidden]){display:block!important;width:100%!important;max-width:100%!important;overflow-x:auto!important;overflow-y:hidden!important;overscroll-behavior-x:contain}.ctca .ctca-findings-table{display:table!important;width:1000px!important;min-width:1000px!important;max-width:1000px!important;table-layout:fixed!important;border-collapse:separate!important;border-spacing:0!important;background:#fff!important;font-size:14px!important;line-height:1.5!important}.ctca .ctca-findings-table thead{display:table-header-group!important}.ctca .ctca-findings-table tbody{display:table-row-group!important}.ctca .ctca-findings-table tr{display:table-row!important}.ctca .ctca-findings-table th,.ctca .ctca-findings-table td{display:table-cell!important;box-sizing:border-box!important;vertical-align:top!important;text-align:left!important;padding:13px 14px!important;border-bottom:1px solid #e5ebf2!important;white-space:normal!important;word-break:normal!important;overflow-wrap:anywhere!important;hyphens:auto}.ctca .ctca-findings-table th{position:static!important;background:#eaf2fa!important;color:#173b65!important;font-weight:750!important;border-bottom:2px solid #cbd9e8!important}.ctca .ctca-findings-table tbody tr:nth-child(even){background:#f8fafc!important}.ctca .ctca-findings-table th:nth-child(1),.ctca .ctca-findings-table td:nth-child(1){width:95px!important;min-width:95px!important}.ctca .ctca-findings-table th:nth-child(2),.ctca .ctca-findings-table td:nth-child(2){width:130px!important;min-width:130px!important}.ctca .ctca-findings-table th:nth-child(3),.ctca .ctca-findings-table td:nth-child(3){width:90px!important;min-width:90px!important}.ctca .ctca-findings-table th:nth-child(4),.ctca .ctca-findings-table td:nth-child(4){width:230px!important;min-width:230px!important}.ctca .ctca-findings-table th:nth-child(5),.ctca .ctca-findings-table td:nth-child(5){width:220px!important;min-width:220px!important}.ctca .ctca-findings-table th:nth-child(6),.ctca .ctca-findings-table td:nth-child(6){width:235px!important;min-width:235px!important}.ctca .ctca-findings-table a{overflow-wrap:anywhere!important;word-break:normal!important}.ctca-print-brand{display:none}@media print{@page{size:landscape;margin:8mm}body *{visibility:hidden}.ctca-results,.ctca-results *{visibility:visible}.ctca-results{position:absolute;left:0;top:0;width:100%;border:0;box-shadow:none;padding:0;color:#1b2d44;font-family:Arial,sans-serif}.ctca-print-brand{display:block!important;border-bottom:3px solid #16845b;padding:0 0 14px;margin:0 0 18px;break-after:avoid}.ctca-print-brand .ctca-brand-lockup{display:flex;align-items:center;gap:18px}.ctca-print-brand .ctca-brand-logo{display:block!important;width:118px!important;height:auto!important;max-height:54px;object-fit:contain;flex:0 0 118px}.ctca-print-brand .ctca-brand-name{font-size:22px;font-weight:800;letter-spacing:.2px;color:#12304c;margin:0 0 5px}.ctca-print-brand .ctca-brand-accent{color:#16845b}.ctca-print-brand .ctca-brand-subtitle{font-size:11px;color:#536579;margin:0 0 3px}.ctca-print-brand .ctca-brand-url{font-size:10px;color:#16845b;margin:0;font-weight:700}.ctca-results .ctca-filters,.ctca-results button,.ctca-results .ctca-view-toggle,.ctca-results .ctca-suggestion button{display:none!important}.ctca-results #ctca-table-wrap[hidden],.ctca-results #ctca-findings-list[hidden]{display:none!important}.ctca-issue{box-shadow:none;border-color:#cbd5e1;page-break-inside:avoid;break-inside:avoid}.ctca-card,.ctca-suggestion{break-inside:avoid;page-break-inside:avoid}.ctca-results h2,.ctca-results h3{break-after:avoid;page-break-after:avoid}.ctca-table-scroll{overflow:visible;border:0}.ctca .ctca-findings-table{display:table!important;min-width:0!important;width:100%!important;max-width:100%!important;table-layout:fixed!important;font-size:10px!important;line-height:1.35!important}.ctca-findings-table th,.ctca-findings-table td{padding:7px 6px;overflow-wrap:anywhere;word-break:normal;vertical-align:top}.ctca-findings-table th{position:static;background:#eaf2fa!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.ctca .ctca-findings-table th:nth-child(1),.ctca .ctca-findings-table td:nth-child(1){width:9%!important;min-width:0!important}.ctca .ctca-findings-table th:nth-child(2),.ctca .ctca-findings-table td:nth-child(2){width:13%!important;min-width:0!important}.ctca .ctca-findings-table th:nth-child(3),.ctca .ctca-findings-table td:nth-child(3){width:8%!important;min-width:0!important}.ctca .ctca-findings-table th:nth-child(4),.ctca .ctca-findings-table td:nth-child(4){width:23%!important;min-width:0!important}.ctca .ctca-findings-table th:nth-child(5),.ctca .ctca-findings-table td:nth-child(5){width:23%!important;min-width:0!important}.ctca .ctca-findings-table th:nth-child(6),.ctca .ctca-findings-table td:nth-child(6){width:24%!important;min-width:0!important}.ctca-hero,.ctca-form{display:none!important}}.ctca-error{color:#a61b1b}.ctca-ok{color:#167344}@media(max-width:600px){.ctca{margin:12px auto}.ctca-hero{border-radius:14px;padding:22px 18px}.ctca-result-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.ctca-card{padding:10px;min-width:0}.ctca-card strong{font-size:20px}.ctca-issue{padding:12px 8px}.ctca-form,.ctca-results{border-radius:13px}}/* v3.3.13 report layout: readable table widths, stable print pagination and visible score methodology. */
+@media print{
+  @page{size:A4 landscape;margin:8mm}
+  .ctca-results{width:100%!important;max-width:none!important;padding:0!important;margin:0!important}
+  .ctca-results .ctca-result-grid{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:6px!important;margin:6px 0 8px!important}
+  .ctca-results .ctca-card{padding:8px!important;margin:0!important;box-shadow:none!important;break-inside:avoid-page!important;page-break-inside:avoid!important}
+  .ctca-results .ctca-card strong{font-size:17px!important;margin:3px 0!important}
+  .ctca-results h2{font-size:22px!important;margin:8px 0 4px!important}
+  .ctca-results h3{font-size:16px!important;margin:14px 0 6px!important;padding-bottom:4px!important}
+  .ctca-results p{font-size:10px!important;line-height:1.45!important;margin:5px 0!important}
+  .ctca-issue{margin:0 0 6px!important;padding:7px 9px!important;border-radius:6px!important;box-shadow:none!important;break-inside:auto!important;page-break-inside:auto!important}
+  .ctca-issue>strong{font-size:13px!important;margin:3px 0!important}
+  .ctca-issue>p{font-size:9.5px!important;line-height:1.35!important;margin:3px 0!important}
+  .ctca-suggestion{padding:6px 8px!important;margin:4px 0!important;break-inside:auto!important;page-break-inside:auto!important}
+  .ctca-suggestion>strong{font-size:11px!important;margin-bottom:3px!important}
+  .ctca-results .ctca-free-recommendations{padding:8px 10px!important;margin:8px 0!important}
+  .ctca-results .ctca-print-brand{padding-bottom:8px!important;margin-bottom:10px!important}
+  .ctca-print-brand .ctca-brand-logo{width:82px!important;max-height:40px!important;flex-basis:82px!important}
+  .ctca-print-brand .ctca-brand-name{font-size:17px!important;margin-bottom:2px!important}
+  .ctca-print-brand .ctca-brand-subtitle,.ctca-print-brand .ctca-brand-url{font-size:9px!important}
+  .ctca-results ul{margin:4px 0;padding-left:18px!important;font-size:10px!important}
+  .ctca-results li{margin:2px 0!important}
+}
+</style>
+    <div class="ctca"><section class="ctca-hero"><p>FREE WEBSITE CHECKER · FLEXIBLE PAGE LIMITS</p><h2>Find the issues holding your website back.</h2><p>Scan key pages for technical and on-page SEO signals, content structure, indexability hints and broken internal/external links. Select additional audit areas to shape your report.</p></section>
+    <form class="ctca-form" id="ctca-form"><label for="ctca-url">Website URL</label><input id="ctca-url" type="url" placeholder="https://example.com" required><p class="ctca-muted">Enter a public website you own or are authorised to audit. Do not submit passwords, private account data, or confidential information.</p><label for="ctca-scan-limit">Pages to audit</label><select id="ctca-scan-limit" style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:10px;font-size:16px"><option value="1">Single page — 1 page</option><option value="10" selected>Quick scan — 10 pages</option><option value="50">Standard scan — 50 pages</option><option value="100">Extended scan — 100 pages</option><option value="more">More than 100 pages — request by email</option></select><p class="ctca-muted">Free instant audits are available for public websites up to 100 pages. For audits of 101–500 pages, submit a request for our team to review. A request is not a guarantee that the audit will be accepted or completed.</p><p class="ctca-muted">By using this tool, you acknowledge that results are automated, limited to checks actually performed, and may require manual verification. Scores are heuristic indicators, not Google scores. Recommendations do not guarantee rankings, traffic, conversions, revenue, security, or compliance. <a href="<?php echo $privacyUrl; ?>" target="_blank" rel="noopener noreferrer">Privacy Policy</a> · <a href="<?php echo $termsUrl; ?>" target="_blank" rel="noopener noreferrer">Terms of Use</a></p><h3>What would you like to check?</h3><div class="ctca-grid">
+    <?php foreach(['Technical SEO'=>'technical','On-page SEO'=>'onpage','AI SEO / GEO / AEO readiness'=>'ai','Local SEO signals'=>'local','Content quality signals'=>'content','Website speed (PageSpeed API if configured)'=>'speed'] as $label=>$val): ?><label class="ctca-option"><input type="checkbox" name="audits[]" value="<?php echo esc_attr($val); ?>" checked> <?php echo esc_html($label); ?></label><?php endforeach; ?>
+    </div><button id="ctca-submit" type="submit">Run Website Audit</button><p class="ctca-muted">Free instant audit: up to 100 pages. For more than 100 pages, contact creativetechcoderz@gmail.com. Analytics, backlink databases and private account settings cannot be verified without authorised access.</p><div id="ctca-status" aria-live="polite"></div></form><div id="ctca-results" class="ctca-results" hidden style="margin-top:20px"></div></div>
+    <script>(function(){const f=document.getElementById('ctca-form'),b=document.getElementById('ctca-submit'),s=document.getElementById('ctca-status'),r=document.getElementById('ctca-results'),limitSelect=document.getElementById('ctca-scan-limit');f.addEventListener('submit',async e=>{e.preventDefault();r.hidden=true;s.textContent='Scanning pages and checking available signals. This may take a little while…';b.disabled=true;try{const audits=[...f.querySelectorAll('input[name="audits[]"]:checked')].map(x=>x.value);if(limitSelect.value==='more'){const targetUrl=document.getElementById('ctca-url').value.trim();s.innerHTML='<div class="ctca-request-box" style="margin-top:16px;padding:18px;border:1px solid #cbd5e1;border-radius:12px;background:#f8fafc"><h3>Request a Larger Website Audit</h3><p class="ctca-muted">Free audits up to 100 pages are instant. For 101–500 pages, submit your details and our team will contact you by email. No audit has started yet.</p><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px"><div><label for="ctca-request-name">Name</label><input id="ctca-request-name" type="text" autocomplete="name" required style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:8px"></div><div><label for="ctca-request-email">Email</label><input id="ctca-request-email" type="email" autocomplete="email" required style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:8px"></div><div style="grid-column:1/-1"><label for="ctca-request-url">Website URL</label><input id="ctca-request-url" type="url" required value="'+esc(targetUrl)+'" style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:8px"></div></div><p><label style="font-weight:500"><input id="ctca-request-authorized" type="checkbox" required> I confirm that I own this website or have permission to request its audit.</label></p><p><label style="font-weight:500"><input id="ctca-request-privacy" type="checkbox" required> I have read the <a href="<?php echo $privacyUrl; ?>" target="_blank" rel="noopener noreferrer">Privacy Policy</a> and <a href="<?php echo $termsUrl; ?>" target="_blank" rel="noopener noreferrer">Terms of Use</a>.</label></p><div style="position:absolute;left:-9999px" aria-hidden="true"><label for="ctca-request-company">Company</label><input id="ctca-request-company" type="text" tabindex="-1" autocomplete="off"></div><button type="button" id="ctca-request-submit" style="margin-top:14px">Submit Audit Request</button><p id="ctca-request-note" class="ctca-muted" aria-live="polite"></p></div>';document.getElementById('ctca-request-submit').addEventListener('click',()=>{const name=document.getElementById('ctca-request-name'),email=document.getElementById('ctca-request-email'),website=document.getElementById('ctca-request-url'),note=document.getElementById('ctca-request-note');if(!name.value.trim()||!email.checkValidity()||!website.checkValidity()||!website.value.trim()||!document.getElementById('ctca-request-authorized').checked||!document.getElementById('ctca-request-privacy').checked){note.textContent='Please complete all fields and confirm website authorization and policy acknowledgement.';return;}const submitBtn=document.getElementById('ctca-request-submit');submitBtn.disabled=true;note.textContent='Submitting your request securely…';fetch(<?php echo wp_json_encode($largeRequestEndpoint); ?>,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.value.trim(),email:email.value.trim(),url:website.value.trim(),audits:audits,authorization:document.getElementById('ctca-request-authorized').checked,privacy_ack:document.getElementById('ctca-request-privacy').checked,company:document.getElementById('ctca-request-company').value})}).then(async response=>{const payload=await response.json().catch(()=>({message:'Unexpected server response. Please try again later.'}));if(!response.ok)throw new Error(payload.message||'Request could not be submitted.');note.textContent=payload.message||'Your request has been submitted.';note.className='ctca-ok';}).catch(error=>{note.textContent=error.message||'Request failed. Please try again later.';note.className='ctca-error';}).finally(()=>{submitBtn.disabled=false;});});return;}let scanLimit=Number(limitSelect.value);if(!Number.isInteger(scanLimit)||scanLimit<1||scanLimit>100)throw new Error('Instant audits are limited to 100 pages. For larger audits, use the email request option.');const resp=await fetch(<?php echo wp_json_encode($endpoint); ?>,{method:'POST',headers:{'Content-Type':'application/json','X-WP-Nonce':<?php echo wp_json_encode($restNonce); ?>},body:JSON.stringify({url:document.getElementById('ctca-url').value,audits,scan_limit:scanLimit})});const responseText=await resp.text();let data;try{data=JSON.parse(responseText)}catch(parseError){throw new Error('The server returned an unexpected response instead of JSON. Please try again later; no complete report was received.')}if(!resp.ok)throw new Error(data.message||'The audit could not be completed.');let html='<div class="ctca-print-brand"><div class="ctca-brand-lockup"><img class="ctca-brand-logo" src="https://creativetechcoderz.com/wp-content/uploads/2026/10/cropped-creative-tech-coderz-logo-transparent-2.png" alt="Creative Tech Coderz logo"><div><p class="ctca-brand-name">Creative Tech <span class="ctca-brand-accent">Coderz</span></p><p class="ctca-brand-subtitle">Website Audit Report · SEO, Technical SEO &amp; AI Search Readiness</p><p class="ctca-brand-url">creativetechcoderz.com</p></div></div></div><h2>Website Audit Report</h2><p><strong>Website:</strong> '+esc(data.url)+' · <strong>Pages checked:</strong> '+data.pages_checked+' · <strong>Page fetch attempts:</strong> '+(data.pages_attempted||data.pages_checked)+' / '+data.scan_limit+'</p><p class="ctca-muted">Scan generated: '+esc(data.generated_at||'not available')+'</p><p class="ctca-muted"><strong>Scoring method:</strong> '+esc((data.summary&&data.summary.score_method)||'Weighted heuristic; method version not supplied')+' · <strong>Points deducted:</strong> '+esc((data.summary&&data.summary.score_deductions!==undefined)?data.summary.score_deductions:'not supplied')+' · Scores are directional and may differ across plugin scoring versions.</p><div class="ctca-result-grid"><div class="ctca-card">Audit score<strong>'+data.score+'/100</strong><span class="ctca-muted">Heuristic, not Google score</span></div><div class="ctca-card">Pages scanned<strong>'+data.pages_checked+'</strong></div><div class="ctca-card">Issues detected<strong>'+data.issues.length+'</strong></div><div class="ctca-card">Pages with title issues<strong>'+data.summary.title_issues+'</strong></div><div class="ctca-card">Pages with description issues<strong>'+data.summary.description_issues+'</strong></div></div><h3>Category breakdown</h3><div class="ctca-result-grid">'+Object.entries(data.summary.by_category||{}).map(([name,count])=>'<div class="ctca-card">'+esc(name)+'<strong>'+(data.summary.category_scores&&data.summary.category_scores[name]!==undefined&&data.summary.category_scores[name]!==null?data.summary.category_scores[name]+'/100':(data.summary.category_scores&&data.summary.category_scores[name]===null?'Not tested':count))+'</strong><span class="ctca-muted">'+count+' finding(s) · heuristic score</span></div>').join('')+'</div><div class="ctca-free-recommendations"><h3>Free recommendations</h3><p class="ctca-muted">Issue-specific recommendations and suggested fixes are generated locally from built-in rules. No API key, paid AI service, or credits are required.</p></div><h3>Findings</h3><div class="ctca-filters" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0"><input id="ctca-search" type="search" placeholder="Search findings or URLs" style="padding:10px;border:1px solid #cbd5e1;border-radius:8px;flex:1;min-width:200px"><select id="ctca-severity" style="padding:10px;border:1px solid #cbd5e1;border-radius:8px"><option value="">All severities</option>'+[...new Set(data.issues.map(i=>i.severity))].map(v=>'<option>'+esc(v)+'</option>').join('')+'</select><select id="ctca-category" style="padding:10px;border:1px solid #cbd5e1;border-radius:8px"><option value="">All categories</option>'+[...new Set(data.issues.map(i=>i.category||'General'))].map(v=>'<option>'+esc(v)+'</option>').join('')+'</select></div><p id="ctca-filter-count" class="ctca-muted"></p><div id="ctca-findings-list">';if(!data.issues.length)html+='<p>No issues were detected by the checks that ran. This is not a guarantee that the website is error-free.</p>';data.issues.forEach(i=>{html+='<div class="ctca-issue" data-severity="'+esc(i.severity)+'" data-category="'+esc(i.category||'General')+'" data-search="'+esc([i.title,i.detail,i.page,i.recommendation||''].join(' '))+'"><span class="ctca-badge">'+esc(i.severity)+'</span> <span class="ctca-muted">'+esc(i.category||'General')+' · '+esc(i.issue_id||'')+'</span> <strong>'+esc(i.title)+'</strong><p>'+esc(i.detail)+'</p>'+'<p class="ctca-muted"><strong>Priority:</strong> '+esc(i.priority||'Review')+' · <strong>Effort:</strong> '+esc(i.effort||'Review required')+'</p>'+(i.recommendation?'<p><strong>Recommended action:</strong> '+esc(i.recommendation)+'</p>':'')+(i.suggested_fix?'<div class="ctca-suggestion"><strong>Suggested fix / draft</strong><p>'+esc(i.suggested_fix)+'</p><button type="button" class="ctca-copy-fix" data-fix="'+esc(i.suggested_fix)+'">Copy suggestion</button></div>':'')+'<p class="ctca-muted">Page: '+esc(i.page)+'</p></div>'});html+='</div><div class="ctca-view-toggle" role="group" aria-label="Finding display" style="display:flex;gap:8px;flex-wrap:wrap;margin:18px 0"><button type="button" id="ctca-report-view" aria-pressed="true">Report view</button><button type="button" id="ctca-table-view" aria-pressed="false">Table view</button></div>';html+='<div id="ctca-table-wrap" class="ctca-table-scroll" hidden><table class="ctca-findings-table"><thead><tr><th>ID</th><th>Category</th><th>Priority</th><th>Finding</th><th>Page URL</th><th>Recommended action</th></tr></thead><tbody>';data.issues.forEach(i=>{html+='<tr><td>'+esc(i.issue_id||'')+'</td><td>'+esc(i.category||'General')+'</td><td>'+esc(i.priority||i.severity||'Review')+'</td><td>'+esc(i.title||'')+'<br><small>'+esc(i.detail||'')+'</small></td><td><a href="'+esc(i.page||'#')+'" target="_blank" rel="noopener">'+esc(i.page||'')+'</a></td><td>'+esc(i.recommendation||i.suggested_fix||'Review manually')+'</td></tr>';});html+='</tbody></table></div>';if(data.pages.length){html+='<h3>Pages reviewed</h3><ul>';data.pages.forEach(p=>html+='<li><a href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.url)+'</a></li>');html+='</ul>'}html+='<button type="button" id="ctca-csv">Download findings CSV</button> <button type="button" onclick="window.print()">Print / Save Report as PDF</button><p class="ctca-muted"><strong>Important limitations:</strong> This automated report reflects only the pages and checks completed at the time shown. Findings can be incomplete or require manual verification; unavailable or skipped checks are not proof of success or failure. Scores are heuristic indicators, not Google scores. Recommendations are guidance, do not apply fixes automatically, and do not guarantee rankings, traffic, conversions, revenue, security, or legal compliance. Review and test changes before implementation and maintain suitable backups. PageSpeed data is supplied by Google when configured and is subject to its service availability and terms.</p><p class="ctca-muted">Prepared by Creative Tech Coderz · <a href="<?php echo $privacyUrl; ?>">Privacy Policy</a> · <a href="<?php echo $termsUrl; ?>">Terms of Use</a></p>';r.innerHTML=html;r.hidden=false;const reportViewBtn=document.getElementById('ctca-report-view'),tableViewBtn=document.getElementById('ctca-table-view'),tableWrap=document.getElementById('ctca-table-wrap'),findingsList=document.getElementById('ctca-findings-list');const setFindingView=(mode)=>{const table=mode==='table';tableWrap.hidden=!table;findingsList.hidden=table;reportViewBtn.setAttribute('aria-pressed',String(!table));tableViewBtn.setAttribute('aria-pressed',String(table));reportViewBtn.style.opacity=table?'.7':'1';tableViewBtn.style.opacity=table?'1':'.7';};reportViewBtn.addEventListener('click',()=>setFindingView('report'));tableViewBtn.addEventListener('click',()=>setFindingView('table'));const applyFilters=()=>{const q=(document.getElementById('ctca-search')?.value||'').toLowerCase(),sv=document.getElementById('ctca-severity')?.value||'',cat=document.getElementById('ctca-category')?.value||'';let shown=0;r.querySelectorAll('#ctca-findings-list .ctca-issue').forEach(el=>{const ok=(!q||(el.dataset.search||'').toLowerCase().includes(q))&&(!sv||el.dataset.severity===sv)&&(!cat||el.dataset.category===cat);el.hidden=!ok;if(ok)shown++;});const c=document.getElementById('ctca-filter-count');if(c)c.textContent='Showing '+shown+' of '+r.querySelectorAll('#ctca-findings-list .ctca-issue').length+' findings';};['ctca-search','ctca-severity','ctca-category'].forEach(id=>document.getElementById(id)?.addEventListener('input',applyFilters));applyFilters();const csvBtn=document.getElementById('ctca-csv');r.querySelectorAll('.ctca-copy-fix').forEach(btn=>btn.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(btn.dataset.fix||'');btn.textContent='Copied';}catch(e){btn.textContent='Copy unavailable';}}));if(csvBtn)csvBtn.addEventListener('click',()=>{const rows=[['Issue ID','Category','Severity','Priority','Estimated effort','Finding','Details','Recommendation','Suggested fix','Page'],...data.issues.map(i=>[i.issue_id||'',i.category||'General',i.severity,i.priority||'Review',i.effort||'Review required',i.title,i.detail,i.recommendation||'',i.suggested_fix||'',i.page])];const csv=rows.map(row=>row.map(v=>{let x=String(v==null?'':v);if(/^[=+@\-\t\r]/.test(x))x="'"+x;return '"'+x.replace(/"/g,'""')+'"'}).join(',')).join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='ctc-website-audit-findings.csv';a.click();URL.revokeObjectURL(a.href)});s.textContent='Audit complete.';r.scrollIntoView({behavior:'smooth',block:'start'});}catch(err){s.innerHTML='<p class="ctca-error">'+esc(err.message)+'</p>'}finally{b.disabled=false}});function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}})();</script>
+    <?php return ob_get_clean();
+  }
+  /** Normalize tracking-only URL variants so they do not consume multiple page slots. */
+  private function page_identity($url){
+    $url=trim((string)$url);$parts=wp_parse_url($url);if(!$parts||empty($parts['host']))return strtolower($url);
+    $scheme=strtolower($parts['scheme']??'https');$host=strtolower(rtrim($parts['host'],'.'));$port=isset($parts['port'])?(int)$parts['port']:null;
+    if(($scheme==='https'&&$port===443)||($scheme==='http'&&$port===80))$port=null;
+    $path=$parts['path']??'/';if($path==='')$path='/';
+    $query=[];if(!empty($parts['query'])){parse_str($parts['query'],$params);foreach($params as $k=>$v){$lk=strtolower((string)$k);if(strpos($lk,'utm_')===0||in_array($lk,['gclid','fbclid','msclkid','yclid','dclid','gbraid','wbraid','_ga','mc_cid','mc_eid'],true))continue;$query[$k]=$v;}ksort($query);}
+    $identity=$scheme.'://'.$host.($port?':'.$port:'').$path;if($query)$identity.='?'.http_build_query($query,'','&',PHP_QUERY_RFC3986);return $identity;
+  }
+  private function safe_url($url){ $url=esc_url_raw(trim((string)$url)); if(!$url||!wp_http_validate_url($url))return false; $p=wp_parse_url($url); if(empty($p['scheme'])||!in_array(strtolower($p['scheme']),['http','https'],true)||empty($p['host'])||isset($p['user'])||isset($p['pass']))return false; if(isset($p['port'])&&((int)$p['port']!==80&&(int)$p['port']!==443))return false; if(isset($p['port'])&&strtolower($p['scheme'])==='http'&&(int)$p['port']!==80)return false; if(isset($p['port'])&&strtolower($p['scheme'])==='https'&&(int)$p['port']!==443)return false; $host=strtolower(trim(rtrim($p['host'],'.'),'[]')); if($host==='localhost'||substr($host,-6)==='.local'||substr($host,-10)==='.localhost'||strpos($host,'.')===false && !filter_var($host,FILTER_VALIDATE_IP))return false; if(filter_var($host,FILTER_VALIDATE_IP)){ if(!filter_var($host,FILTER_VALIDATE_IP,FILTER_FLAG_NO_PRIV_RANGE|FILTER_FLAG_NO_RES_RANGE))return false; } else { $records=@dns_get_record($host,DNS_A|DNS_AAAA); if(!$records)return false; foreach($records as $record){$ip=$record['ip']??($record['ipv6']??''); if($ip && !filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_NO_PRIV_RANGE|FILTER_FLAG_NO_RES_RANGE))return false;} } return $url; }
+  /**
+   * Fetch a public URL with DNS/IP validation tied to the cURL connection.
+   * Fails closed when cURL is unavailable rather than silently using an unpinned transport.
+   */
+  private function safe_remote_get($url,$args=[]){
+    $safe=$this->safe_url($url);
+    if(!$safe)return new WP_Error('unsafe_resource','URL failed public HTTP(S) and IP validation.');
+    if(!function_exists('curl_init')||!defined('CURLOPT_RESOLVE'))return new WP_Error('safe_transport_unavailable','Secure DNS-pinned cURL fetching is unavailable; request blocked.');
+    $parts=wp_parse_url($safe);$host=strtolower(trim((string)($parts['host']??''),'[]'));$scheme=strtolower((string)($parts['scheme']??'https'));$port=isset($parts['port'])?(int)$parts['port']:($scheme==='https'?443:80);
+    $resolve=[];
+    if(!filter_var($host,FILTER_VALIDATE_IP)){
+      $records=@dns_get_record($host,DNS_A|DNS_AAAA);$ips=[];
+      if(is_array($records))foreach($records as $record){$ip=$record['ip']??($record['ipv6']??'');if(!$ip)continue;if(!filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_NO_PRIV_RANGE|FILTER_FLAG_NO_RES_RANGE))return new WP_Error('unsafe_dns','Hostname resolved to a private or reserved IP; request blocked.');$ips[]=$ip;}
+      $ips=array_values(array_unique($ips));if(!$ips)return new WP_Error('dns_unresolved','Could not resolve a public IP for this hostname.');
+      $chosen=$ips[0];$resolveAddress=strpos($chosen,':')!==false?'['.$chosen.']':$chosen;$resolve[]=$host.':'.$port.':'.$resolveAddress;
     }
-
-    public static function on_deactivate() {
-        wp_clear_scheduled_hook('ctca_daily_monitor');
+    $timeout=max(2,min(25,(int)($args['timeout']??10)));$maxBytes=max(1024,min(1500000,(int)($args['limit_response_size']??200000)));$headersIn=(array)($args['headers']??[]);$requestHeaders=[];foreach($headersIn as $k=>$v)$requestHeaders[]=$k.': '.$v;
+    $body='';$responseHeaders=[];$tooLarge=false;$headerBlockStarted=false;$allowTruncated=(bool)($args['allow_truncated_body']??false);$ch=curl_init($safe);
+    if(!$ch)return new WP_Error('curl_init_failed','Could not initialize the secure HTTP client.');
+    $options=[CURLOPT_RETURNTRANSFER=>false,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_MAXREDIRS=>0,CURLOPT_CONNECTTIMEOUT=>min(5,$timeout),CURLOPT_TIMEOUT=>$timeout,CURLOPT_NOSIGNAL=>true,CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_USERAGENT=>(string)($args['user-agent']??'CreativeTechCoderz-Audit/3.3.13'),CURLOPT_HTTPHEADER=>$requestHeaders,
+      CURLOPT_HEADERFUNCTION=>function($curl,$line)use(&$responseHeaders,&$headerBlockStarted){$len=strlen($line);$trim=trim($line);if(preg_match('#^HTTP/\S+\s+\d+#i',$trim)){$responseHeaders=[];$headerBlockStarted=true;return $len;}if($trim!==''&&strpos($line,':')!==false){list($k,$v)=explode(':',$line,2);$k=strtolower(trim($k));$v=trim($v);if(isset($responseHeaders[$k]))$responseHeaders[$k].=', '.$v;else $responseHeaders[$k]=$v;}return $len;},
+      CURLOPT_WRITEFUNCTION=>function($curl,$chunk)use(&$body,&$tooLarge,$maxBytes){$len=strlen($chunk);if(strlen($body)+$len>$maxBytes){$tooLarge=true;return 0;}$body.=$chunk;return $len;}];
+    if($requestHeaders===[])unset($options[CURLOPT_HTTPHEADER]);if($resolve)$options[CURLOPT_RESOLVE]=$resolve;
+    if(defined('CURLOPT_PROTOCOLS')&&defined('CURLPROTO_HTTP')&&defined('CURLPROTO_HTTPS'))$options[CURLOPT_PROTOCOLS]=CURLPROTO_HTTP|CURLPROTO_HTTPS;
+    if(!curl_setopt_array($ch,$options)){$configError=curl_error($ch);curl_close($ch);return new WP_Error('secure_transport_config_failed','Could not apply secure HTTP transport settings: '.sanitize_text_field($configError));}$ok=curl_exec($ch);$curlError=curl_error($ch);$code=(int)curl_getinfo($ch,CURLINFO_RESPONSE_CODE);curl_close($ch);
+    if($tooLarge&&!$allowTruncated)return new WP_Error('response_too_large','Remote response exceeded the configured size limit.');
+    if($ok===false&&!($tooLarge&&$allowTruncated))return new WP_Error('safe_fetch_failed','Secure HTTP request failed: '.sanitize_text_field($curlError));
+    return ['headers'=>$responseHeaders,'response'=>['code'=>$code,'message'=>''],'body'=>$body,'cookies'=>[]];
+  }
+  private function fetch_page($url){$safe=$this->safe_url($url);if(!$safe)return new WP_Error('bad_url','URL is invalid or points to a private/local address.');$current=$safe;for($hop=0;$hop<=3;$hop++){ $current=$this->safe_url($current); if(!$current)return new WP_Error('unsafe_redirect','Redirect target was blocked because it is not a valid public URL.'); $r=$this->safe_remote_get($current,['timeout'=>12,'limit_response_size'=>1500000,'user-agent'=>'CreativeTechCoderz-Audit/3.3.13 (+'.home_url('/').')','headers'=>['Accept'=>'text/html']]);if(is_wp_error($r))return $r;$code=wp_remote_retrieve_response_code($r);if(in_array($code,[301,302,303,307,308],true)){ $loc=wp_remote_retrieve_header($r,'location'); if(!$loc||$hop===3)return new WP_Error('redirect_limit','Too many redirects or missing redirect target.'); if(strpos($loc,'//')===0)$loc=wp_parse_url($current,PHP_URL_SCHEME).':'.$loc; elseif(strpos($loc,'/')===0)$loc=wp_parse_url($current,PHP_URL_SCHEME).'://'.wp_parse_url($current,PHP_URL_HOST).$loc; elseif(!wp_http_validate_url($loc)){ $base=wp_parse_url($current); $origin=$base['scheme'].'://'.$base['host'].(isset($base['port'])?':'.$base['port']:''); if(strpos($loc,'?')===0)$loc=($base['path']??'/').$loc; else $loc=trailingslashit(dirname($base['path']??'/')).$loc; $loc=$origin.'/'.ltrim(preg_replace('#/\./#','/',$loc),'/'); } $current=$loc; continue; } $body=wp_remote_retrieve_body($r);if($code<200||$code>=300)return new WP_Error('fetch_failed','Page returned HTTP '.$code);if(stripos(wp_remote_retrieve_header($r,'content-type'),'text/html')===false)return new WP_Error('not_html','URL did not return HTML.');return ['body'=>$body,'code'=>$code,'final_url'=>$current];} return new WP_Error('redirect_limit','Too many redirects.');}
+  private function fetch_text_resource($url,$limit=200000){$safe=$this->safe_url($url);if(!$safe)return new WP_Error('unsafe_resource','Resource URL is invalid or points to a private/local address.');$r=$this->safe_remote_get($safe,['timeout'=>10,'limit_response_size'=>$limit,'user-agent'=>'CreativeTechCoderz-Audit/3.3.13 (+'.home_url('/').')','headers'=>['Accept'=>'text/plain, application/xml, text/xml, */*']]);if(is_wp_error($r))return $r;$code=wp_remote_retrieve_response_code($r);if($code<200||$code>=300)return new WP_Error('resource_http','Resource returned HTTP '.$code);return ['body'=>wp_remote_retrieve_body($r),'code'=>$code];}
+  private function check_link_status($url){
+    $current=$this->safe_url($url);if(!$current)return new WP_Error('unsafe_link','UNSAFE: destination is not a permitted public HTTP(S) URL.');$original=$current;$chain=[];
+    for($hop=0;$hop<=3;$hop++){
+      $current=$this->safe_url($current);if(!$current)return new WP_Error('unsafe_redirect','UNSAFE: redirect target was blocked by public-URL validation.');
+      $r=$this->safe_remote_get($current,['timeout'=>5,'limit_response_size'=>2048,'allow_truncated_body'=>true,'user-agent'=>'CreativeTechCoderz-Audit/3.3.13 (+'.home_url('/').')','headers'=>['Range'=>'bytes=0-1023','Accept'=>'text/html,application/xhtml+xml,*/*']]);
+      if(is_wp_error($r))return new WP_Error('link_unreachable','Could not verify destination (network, DNS, TLS or timeout): '.$r->get_error_message());
+      $code=(int)wp_remote_retrieve_response_code($r);
+      if(in_array($code,[301,302,303,307,308],true)){
+        $loc=wp_remote_retrieve_header($r,'location');if(!$loc)return new WP_Error('link_redirect','Redirect response did not provide a Location header.');
+        if(strpos($loc,'//')===0)$loc=wp_parse_url($current,PHP_URL_SCHEME).':'.$loc;
+        elseif(strpos($loc,'/')===0)$loc=wp_parse_url($current,PHP_URL_SCHEME).'://'.wp_parse_url($current,PHP_URL_HOST).$loc;
+        elseif(!wp_http_validate_url($loc)){$base=wp_parse_url($current);$origin=$base['scheme'].'://'.$base['host'].(isset($base['port'])?':'.$base['port']:'');if(strpos($loc,'?')===0)$loc=($base['path']??'/').$loc;else $loc=trailingslashit(dirname($base['path']??'/')).$loc;$loc=$origin.'/'.ltrim(preg_replace('#/\./#','/',$loc),'/');}
+        $chain[]=$current.' ['.$code.']';$current=$loc;continue;
+      }
+      return ['status'=>$code,'final_url'=>$current,'redirected'=>($current!==$original),'redirect_chain'=>$chain];
     }
-
-    public function add_admin_menu() {
-        add_menu_page(
-            'CTC Website Audit Pro',
-            'CTC Website Audit Pro',
-            'manage_options',
-            'ctc-website-audit',
-            [$this, 'settings_page'],
-            'dashicons-search',
-            58
-        );
+    return ['status'=>0,'final_url'=>$current,'redirected'=>true,'redirect_chain'=>array_merge($chain,['redirect limit reached'])];
+  }
+  private function parse_page($url,$body){libxml_use_internal_errors(true);$dom=new DOMDocument();$dom->loadHTML('<?xml encoding="utf-8" ?>'.$body);$xp=new DOMXPath($dom);$text=trim(preg_replace('/\s+/u',' ',strip_tags($body)));$title=trim($xp->evaluate('string(//title)'));$desc=trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="description"]/@content)'));$robots=trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="robots"]/@content)'));$h1=(int)$xp->query('//h1')->length;$canonical=trim($xp->evaluate('string(//link[translate(@rel,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="canonical"]/@href)'));$images=$xp->query('//img');$missingAlt=0;foreach($images as $im)if(trim($im->getAttribute('alt'))==='')$missingAlt++;$links=[];$linkDetails=[];$internal=0;$host=strtolower((string)wp_parse_url($url,PHP_URL_HOST));$base=wp_parse_url($url);$origin=$base['scheme'].'://'.$base['host'].(isset($base['port'])?':'.$base['port']:'');foreach($xp->query('//a[@href]') as $a){$href=trim($a->getAttribute('href'));if(!$href||$href[0]==='#'||preg_match('/^(mailto:|tel:|javascript:|data:|sms:)/i',$href))continue;if(strpos($href,'//')===0)$abs=$base['scheme'].':'.$href;elseif(wp_http_validate_url($href))$abs=$href;elseif(strpos($href,'/')===0)$abs=$origin.$href;elseif(strpos($href,'?')===0)$abs=($base['path']??'/').$href;else $abs=trailingslashit(dirname($base['path']??'/')).$href;$abs=preg_replace('/#.*$/','',$abs);if(!wp_http_validate_url($abs))continue;$clean=esc_url_raw($abs);$isInternal=strtolower((string)wp_parse_url($clean,PHP_URL_HOST))===$host;if($isInternal)$internal++;if(count($linkDetails)<100)$linkDetails[]=['url'=>$clean,'anchor'=>sanitize_text_field(trim($a->textContent)),'internal'=>$isInternal,'source'=>$url];if($isInternal&&count($links)<50)$links[]=$clean;}$canonicalHost=strtolower((string)wp_parse_url($canonical,PHP_URL_HOST));$viewport=trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="viewport"]/@content)'));$lang=trim($xp->evaluate('string(//html/@lang)'));$ogTitle=trim($xp->evaluate('string(//meta[translate(@property,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="og:title"]/@content)'));$ogDesc=trim($xp->evaluate('string(//meta[translate(@property,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="og:description"]/@content)'));$schemaCount=(int)$xp->query('//script[translate(@type,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="application/ld+json"]')->length;$canonicalMissing=($canonical==='');$external=0;foreach($xp->query('//a[@href]') as $a){$h=trim($a->getAttribute('href'));if(wp_http_validate_url($h)&&strtolower((string)wp_parse_url($h,PHP_URL_HOST))!==$host)$external++;}$canonicalNodes=$xp->query('//link[contains(concat(" ", normalize-space(translate(@rel,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")), " ") , " canonical ")]');$canonicalCount=$canonicalNodes?$canonicalNodes->length:0;$canonicals=[];if($canonicalNodes)foreach($canonicalNodes as $cn){$cv=trim($cn->getAttribute('href'));if($cv!=='')$canonicals[]=$cv;}$mixed=[];foreach($xp->query('//*[@src or @href]') as $node){foreach(['src','href'] as $attr){$v=trim($node->getAttribute($attr));if(stripos($v,'http://')===0)$mixed[]=$v;}}$pagination=[];foreach($xp->query('//link[@rel and @href]') as $ln){$rel=strtolower(trim($ln->getAttribute('rel')));if(preg_match('/(^|\s)(next|prev)(\s|$)/',$rel))$pagination[]=['rel'=>$rel,'href'=>$ln->getAttribute('href')];}$paginationAnchors=(int)$xp->query('//a[contains(translate(@rel,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"next") or contains(translate(@aria-label,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"next") or contains(translate(normalize-space(string(.)),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"next page")]')->length;$scriptCount=(int)$xp->query('//script[not(@type="application/ld+json")]')->length;$emptyMain=(int)$xp->query('(//main|//*[@role="main"])[1]')->length;$htmlBodyText=trim(preg_replace('/\s+/u',' ',strip_tags($body)));$hasNoscript=(int)$xp->query('//noscript')->length;$viewportScale=($viewport!==''&&stripos($viewport,'width=device-width')!==false);$hasFixedWidth=(bool)preg_match('/<meta[^>]+name=["\']viewport["\'][^>]+content=["\'][^"\']*width\s*=\s*[0-9]{3,}/i',$body);return ['url'=>$url,'title'=>$title,'description'=>$desc,'robots'=>$robots,'h1'=>$h1,'canonical'=>$canonical,'canonical_count'=>$canonicalCount,'canonicals'=>array_values(array_unique($canonicals)),'canonical_missing'=>$canonicalMissing,'canonical_external'=>($canonicalHost&&$canonicalHost!==$host),'images'=>count($images),'missing_alt'=>$missingAlt,'text_length'=>mb_strlen($text),'internal_links'=>$internal,'external_links'=>$external,'viewport_present'=>($viewport!==''),'viewport_responsive'=>$viewportScale,'fixed_width_viewport'=>$hasFixedWidth,'html_lang'=>$lang,'og_title_present'=>($ogTitle!==''),'og_description_present'=>($ogDesc!==''),'jsonld_blocks'=>$schemaCount,'mixed_content'=>array_values(array_unique($mixed)),'pagination_hints'=>$pagination,'pagination_anchors'=>$paginationAnchors,'script_count'=>$scriptCount,'noscript_count'=>$hasNoscript,'main_region_present'=>($emptyMain>0),'links'=>array_values(array_unique($links)),'link_details'=>$linkDetails];}
+  public function scan($req){$scheduled=$this->is_scheduled_run;$requestedLimit=absint($req->get_param('scan_limit'));if(!$requestedLimit)$requestedLimit=10;$requestedLimit=max(1,min(500,$requestedLimit));$adminAuthorized=current_user_can('manage_options')&&wp_verify_nonce((string)($_SERVER['HTTP_X_WP_NONCE']??''),'wp_rest');if(!$scheduled&&$requestedLimit>100)return new WP_Error('large_audit_email_required','Instant audits are free up to 100 pages. For larger audits, email creativetechcoderz@gmail.com.',['status'=>400]);$scanLimit=min(100,$requestedLimit);$ip=$_SERVER['REMOTE_ADDR']??'unknown';$key='ctca_'.md5($ip);$globalKey='ctca_global_scan_window';if(!$scheduled){if(get_transient($key))return new WP_Error('rate_limited','Please wait at least 90 seconds before running another audit from this network.',['status'=>429]);$globalCount=(int)get_transient($globalKey);if($globalCount>=20)return new WP_Error('site_scan_limit','The site has reached its temporary scan budget. Try again later.',['status'=>429]);set_transient($key,1,90);set_transient($globalKey,$globalCount+1,10*MINUTE_IN_SECONDS);}$url=$this->safe_url((string)$req->get_param('url'));if(!$url)return new WP_Error('invalid_url','Enter a valid public http or https website URL.',['status'=>400]);$rootUrl=$url;$audits=(array)$req->get_param('audits');$rootHost=strtolower((string)wp_parse_url($url,PHP_URL_HOST));$queue=[$url];$depthMap=[$url=>0];$rootIdentity=$this->page_identity($url);$queued=[$rootIdentity=>true];$seen=[];$scanAttempts=0;$pages=[];$issues=[];$summary=['title_issues'=>0,'description_issues'=>0];$add=function($sev,$title,$detail,$page)use(&$issues){
+      $title=(string)$title;$detail=(string)$detail;$page=(string)$page;$sev=(string)$sev;
+      // Normalize legacy/equivalent OG wording so one page does not show both "not detected" and "missing".
+      $titleLower=strtolower($title);
+      if(strpos($titleLower,'open graph title')!==false){$title='Open Graph title missing';$sev='Low';}
+      elseif(strpos($titleLower,'open graph description')!==false){$title='Open Graph description missing';$sev='Low';}
+      $low=strtolower($title);$category='Technical SEO';
+      if(strpos($low,'pagespeed')!==false||strpos($low,'performance')!==false||strpos($low,'lighthouse')!==false||strpos($low,'core web vitals')!==false)$category='Website speed';
+      elseif(strpos($low,'link')!==false||strpos($low,'redirect')!==false)$category='Technical SEO';
+      elseif(strpos($low,'meta')!==false||strpos($low,'title')!==false||strpos($low,'heading')!==false||strpos($low,'open graph')!==false||strpos($low,'image')!==false)$category='On-page SEO';
+      elseif(strpos($low,'ai seo')!==false)$category='AI SEO / GEO / AEO';
+      elseif(strpos($low,'local seo')!==false)$category='Local SEO';
+      elseif(strpos($low,'content')!==false||strpos($low,'text volume')!==false||strpos($low,'readability')!==false)$category='Content quality signals';
+      elseif(strpos($low,'sitemap')!==false||strpos($low,'robots')!==false||strpos($low,'canonical')!==false||strpos($low,'index')!==false)$category='Technical SEO';
+      $recommendation='Review the evidence and make the change only if it matches the intended page behavior.';$suggestion='';$pageContext='';foreach($pages as $knownPage){if(($knownPage['url']??'')===$page){$pageContext=trim((string)($knownPage['title']??''));break;}}$topic=$pageContext!==''?$pageContext:trim((string)wp_parse_url($page,PHP_URL_PATH),' /');$topic=$topic!==''?str_replace(['-','_'],' ',$topic):'this page';
+      if(strpos($low,'missing page title')!==false)$recommendation='Add a unique, descriptive title that accurately represents this page.';
+      elseif(strpos($low,'meta description')!==false)$recommendation='Write a useful, page-specific description; treat length as a guideline, not a ranking rule.';
+      elseif(strpos($low,'canonical')!==false)$recommendation='Inspect the rendered canonical URL and confirm it matches the intended preferred URL.';
+      elseif(strpos($low,'broken link')!==false)$recommendation='Open the destination manually; update the link, restore the target page, or redirect it where appropriate.';
+      elseif(strpos($low,'redirect')!==false)$recommendation='Review the redirect chain and update the source link to the final URL if appropriate.';
+      elseif(strpos($low,'sitemap')!==false)$recommendation='Check the sitemap URL advertised by robots.txt and try common WordPress/SEO-plugin sitemap locations before declaring it missing.';
+      elseif(strpos($low,'page could not be checked')!==false)$recommendation='Retry the URL and inspect its response status; access restrictions and transient errors are not necessarily broken pages.';
+      elseif(strpos($low,'images missing')!==false)$recommendation='Add meaningful alt text to informative images; use empty alt text for decorative images.';
+      elseif(strpos($low,'pagespeed')!==false){if(stripos($detail,'The PageSpeed request failed:')!==false){$recommendation='The PageSpeed API request did not return a successful result. Check the API key, API enablement, quota, key restrictions and target URL, then rerun the test. Do not interpret this as a website performance score.';}elseif(stripos($detail,'Lighthouse lab results')!==false||stripos($detail,'Lighthouse performance')!==false){$recommendation='The PageSpeed API request succeeded and returned Lighthouse lab results. Use the reported lab metrics and score to prioritize specific bottlenecks. Real-user field data is separate and may be unavailable for low-traffic URLs; missing field data is not itself a performance failure.';}else{$recommendation='PageSpeed metrics are incomplete or unavailable. Check the status and returned diagnostics before drawing conclusions; missing data alone does not indicate poor performance.';}if(preg_match('/lab LCP\s+([0-9.]+)\s*s/i',$detail,$lm)&&((float)$lm[1])>2.5)$recommendation.=' Lab LCP exceeds 2.5 seconds; inspect the largest content element, image dimensions and format, server response time, and render-blocking resources.';}
+      elseif(strpos($low,'link access restricted')!==false)$recommendation='The destination refused or rate-limited the automated request. Open it manually or retry later; do not classify it as broken unless a confirmed failure is observed.';
+      elseif(strpos($low,'broken link check summary')!==false)$recommendation='Use this summary to understand coverage: fix confirmed 404/410 destinations first, review other 4xx and redirects manually, and treat unchecked or inconclusive destinations as unknown rather than healthy.';
+      elseif(strpos($low,'broken link check limit')!==false)$recommendation='Run another scan with a different start path or prioritize important URLs. Destinations beyond this scan limit have not been checked; do not infer that they work.';
+      elseif(strpos($low,'orphan-page discovery limitation')!==false)$recommendation='For fuller orphan-page discovery, compare the crawl with sitemap URLs and a complete URL inventory from analytics or Search Console. This limited crawl cannot prove that no orphan pages exist.';
+      elseif(strpos($low,'sitemap url response validation')!==false)$recommendation='Review the sampled URLs and remember that this is a bounded sample, not a complete indexability or Search Console validation. Inspect any individual errors or redirects listed separately.';
+      elseif(strpos($low,'ai seo / geo / aeo checks are limited')!==false)$recommendation='Treat these as technical readiness signals only. To measure actual AI visibility, separately track citations or mentions in the target AI search products; this plugin does not measure those results.';
+      elseif(strpos($low,'local seo checks require external verification')!==false)$recommendation='Manually verify the business profile, primary business name/address/phone, service areas, map visibility and important directory listings. This crawler cannot access or validate those external records.';
+      elseif(strpos($low,'local contact information needs manual review')!==false)$recommendation='Inspect the visible homepage and contact page for accurate business name, address or service area, phone and opening hours where relevant. This metadata-only check cannot confirm whether the details are present in the page body.';
+      // Specific report guidance overrides broad keyword matches above.
+      if(strpos($low,'broken link check summary')!==false)$recommendation='Prioritize confirmed 404/410 destinations. Review other 4xx responses and redirects manually, and treat unchecked or inconclusive destinations as unknown rather than healthy.';
+      elseif(strpos($low,'broken link check limit')!==false)$recommendation='This scan stopped at its configured destination limit. Run additional scans from important site sections or use a complete URL inventory; unchecked destinations have not been verified.';
+      elseif(strpos($low,'sitemap url response validation')!==false)$recommendation='This is a bounded sample, not a complete indexability or Search Console check. Review individual URL errors and redirects listed separately.';
+      elseif(strpos($low,'orphan-page discovery limitation')!==false)$recommendation='Compare the crawl with sitemap URLs and a complete URL inventory from analytics or Search Console. A limited crawl cannot prove that no orphan pages exist.';
+      elseif(strpos($low,'ai seo / geo / aeo checks are limited')!==false)$recommendation='These are technical readiness signals only. Track actual citations or mentions separately in target AI search products; this plugin does not measure AI visibility.';
+      elseif(strpos($low,'local seo checks require external verification')!==false)$recommendation='Manually verify the business profile, name/address/phone consistency, service areas, map visibility and important directory listings; this crawler cannot validate external records.';
+      elseif(strpos($low,'local contact information needs manual review')!==false)$recommendation='Inspect the visible homepage and contact page for accurate business name, address or service area, phone and hours where relevant. This metadata-only check cannot confirm whether details are present in the page body.';
+      elseif(strpos($low,'link access restricted')!==false)$recommendation='The destination refused or rate-limited the automated request. Open it manually or retry later; do not classify it as broken without a confirmed failure.';
+      if(strpos($low,'missing meta description')!==false||strpos($low,'concise page summary missing')!==false){$suggestion=substr('Explore '.$topic.' with clear information, helpful details and practical guidance to help you choose the right solution for your needs.',0,155);$recommendation='Review this draft against the actual page content and intended search intent before publishing.';}elseif(strpos($low,'missing page title')!==false){$suggestion=substr($topic.' | Official Information and Services',0,60);$recommendation='Edit this draft to match the page’s actual subject, brand and search intent.';}elseif(strpos($low,'images missing')!==false){$suggestion='Draft alt text per image: describe its meaningful subject and purpose in context. Do not reuse one generic alt value for every image; use empty alt text for decorative images.';}elseif(strpos($low,'no h1')!==false||strpos($low,'primary topic heading missing')!==false){$suggestion=ucwords($topic);$recommendation='Use this as a draft only if it accurately describes the visible page content.';}elseif(strpos($low,'broken link')!==false||strpos($low,'link destination returned')!==false){$suggestion='Review destination manually; update the link to a verified relevant live URL, restore the intended resource, or remove it if no suitable replacement exists.';}elseif(strpos($low,'duplicate canonical declarations')!==false){$suggestion='Verify the rendered canonical link elements and confirm they all point to the intended preferred URL. If duplicate tags are unintended, remove the extra declaration at its source; do not change the target without confirming the correct canonical URL.';}elseif(strpos($low,'conflicting canonical urls')!==false){$suggestion='Compare each rendered canonical href with the intended preferred URL. Correct the source that emits the unintended target so the page has one consistent canonical target; verify after clearing cache.';}elseif(strpos($low,'canonical')!==false){$suggestion='Confirm whether this page should have a self-referencing canonical or an intentional canonical to another URL. Verify the rendered href before changing it.';}elseif(strpos($low,'open graph title')!==false){$suggestion=$pageContext!==''?$pageContext:ucwords($topic);}elseif(strpos($low,'open graph description')!==false){$suggestion='Learn more about '.$topic.' through clear, accurate information and helpful resources.';}elseif(strpos($low,'sitemap url returned')!==false){$suggestion='Update the sitemap entry only after confirming the correct final URL and intended indexability.';}elseif(strpos($low,'redirect')!==false){$suggestion='Update internal links to point directly to the verified final destination; investigate loops before changing redirect rules.';}elseif(strpos($low,'mixed-content')!==false){$suggestion='Replace the affected HTTP resource with its verified HTTPS URL, or remove it if no secure version exists.';}elseif(strpos($low,'pagespeed')!==false){$suggestion='Use PageSpeed diagnostics to identify the LCP element and render-blocking resources; optimize the actual largest element, defer non-critical scripts, and validate again. Avoid applying blanket changes without testing.';}elseif(strpos($low,'structured data')!==false||strpos($low,'json-ld')!==false){$suggestion='Generate schema only after confirming the correct page type and values against visible page content; validate before publishing.';}elseif(strpos($low,'viewport')!==false||strpos($low,'responsive')!==false){$suggestion='<meta name="viewport" content="width=device-width, initial-scale=1">';}
+      $fingerprint=md5(strtolower($sev.'|'.$title.'|'.$detail.'|'.$page));foreach($issues as $existing)if(($existing['_fingerprint']??'')===$fingerprint)return;
+      $priority=in_array(strtolower($sev),['critical','high'],true)?'Urgent':(strtolower($sev)==='medium'?'Prioritize':(strtolower($sev)==='warning'?'Investigate':(strtolower($sev)==='low'?'Routine':(strtolower($sev)==='info'?'Informational':'Verify'))));$effort=(strpos($low,'broken link')!==false||strpos($low,'meta description')!==false||strpos($low,'page title')!==false||strpos($low,'alt text')!==false)?'Quick fix':(strpos($low,'redirect')!==false||strpos($low,'canonical')!==false||strpos($low,'pagespeed')!==false?'Moderate effort':'Review required');$issues[]=['issue_id'=>'CTC-'.strtoupper(substr(md5($category.'|'.$title.'|'.$page.'|'.$detail),0,8)),'category'=>$category,'severity'=>$sev,'priority'=>$priority,'effort'=>$effort,'title'=>$title,'detail'=>$detail,'recommendation'=>$recommendation,'suggested_fix'=>$suggestion,'page'=>$page,'_fingerprint'=>$fingerprint];
+    };while($queue&&$scanAttempts<$scanLimit){$next=array_shift($queue);$next=$this->safe_url($next);if(!$next)continue;$identity=$this->page_identity($next);unset($queued[$identity]);if(isset($seen[$identity]))continue;if(strtolower((string)wp_parse_url($next,PHP_URL_HOST))!==$rootHost)continue;$seen[$identity]=true;$scanAttempts++;$f=$this->fetch_page($next);if(is_wp_error($f)){$msg=$f->get_error_message();if(stripos($msg,'redirect')!==false)$add('High','Redirect chain or loop blocked crawl',$msg.' Check redirect rules for loops, chains, and cross-host targets.',$next);else $add('Warning','Page could not be checked',$msg,$next);continue;}$p=$this->parse_page($next,$f['body']);$pages[]=$p;if(in_array('technical',$audits,true)){if($p['canonical_count']>1){$canonUniq=count($p['canonicals']);if($canonUniq>1){$add('High','Conflicting canonical URLs','Found '.$p['canonical_count'].' canonical link elements with '.$canonUniq.' distinct href values. Conflicting canonical targets can send inconsistent preferred-URL signals.',$next);}else{$add('Review','Duplicate canonical declarations','Found '.$p['canonical_count'].' canonical link elements but only one unique href value. This is duplicate markup to investigate, not evidence of conflicting canonical targets by itself.',$next);}}if(!empty($p['mixed_content']))$add('High','Mixed-content references detected','Found '.count($p['mixed_content']).' HTTP resource/link reference(s) on an HTTPS page. Review whether these are active resources (scripts, styles, images, frames) or ordinary links; upgrade active resources to HTTPS where possible. Examples: '.implode(', ',array_slice($p['mixed_content'],0,5)),$next);if(!$p['viewport_responsive'])$add('Review','Responsive viewport signal needs review','The page does not declare a standard width=device-width viewport. This is a static HTML signal only; it does not replace real-device responsive testing.',$next);if($p['fixed_width_viewport'])$add('Review','Fixed-width viewport signal','A numeric fixed-width viewport declaration was detected; verify the layout on narrow screens.',$next);if($p['script_count']>0&&$p['text_length']<300)$add('Review','JavaScript-rendered content / crawlability limitation','The raw HTML has '.$p['script_count'].' non-JSON-LD script(s) and relatively little extracted text. Content may be injected by JavaScript and not fully represented in this HTML-only crawl. Verify rendered DOM and Google URL Inspection separately.',$next);if($p['pagination_anchors']>0&&empty($p['pagination_hints']))$add('Info','Pagination discovery hint','Next-page links were detected but rel=next/prev hints were not found. Search engines generally do not require rel=next/prev; ensure paginated URLs are linked and independently crawlable.',$next);if(!empty($p['pagination_hints']))$add('Info','Pagination link hints detected','Detected pagination rel hints: '.implode(', ',array_map(function($x){return $x['rel'].'='.$x['href'];},$p['pagination_hints'])).'. Verify URLs resolve and pagination links are crawlable.',$next);}if(!$p['title']){$summary['title_issues']++;$add('High','Missing page title','Add a unique, descriptive title that matches the page intent.',$next);}elseif(mb_strlen($p['title'])>60)$add('Review','Long page title','Detected title ('.mb_strlen($p['title']).' characters): “'.$p['title'].'”. Review whether it can be made clearer and more concise for users; title length alone does not determine rankings.',$next);if(!$p['description']){$summary['description_issues']++;$add('Medium','Missing meta description','Write a useful page-specific description to improve search-result presentation.',$next);} elseif(mb_strlen($p['description'])>160)$add('Review','Long meta description','Review this description for concise, useful wording; search engines may truncate snippets.',$next); elseif(mb_strlen($p['description'])<70)$add('Review','Short meta description','Consider expanding the description so it communicates the page value clearly.',$next);if($p['h1']===0)$add('Medium','No H1 heading detected','Add a clear primary heading describing the page.',$next);elseif($p['h1']>1)$add('Review','Multiple H1 headings','Review heading hierarchy for clarity; multiple H1s are not automatically a search penalty.',$next);if(stripos($p['robots'],'noindex')!==false)$add('High','Noindex directive detected','Confirm whether this page should be excluded from search indexing.',$next);if($p['canonical_missing'])$add('Review','Canonical link not detected','Check whether this page should declare a self-referencing or otherwise intentional canonical URL.',$next);if($p['canonical_external'])$add('High','Canonical points to another host','Verify that the canonical URL is intentional.',$next);if(in_array('technical',$audits,true)&&!$p['viewport_present'])$add('Review','Viewport meta tag not detected','Check that the page includes a mobile viewport declaration.',$next);if(in_array('technical',$audits,true)&&!$p['html_lang'])$add('Review','HTML language not declared','Add the correct lang attribute to the html element for accessibility and language identification.',$next);if(in_array('technical',$audits,true)&&!$p['jsonld_blocks'])$add('Review','No JSON-LD structured data detected','Check whether relevant structured data is appropriate for this page; not every page requires JSON-LD.',$next);if(in_array('onpage',$audits,true)&&!$p['og_title_present'])$add('Review','Open Graph title not detected','Add an appropriate og:title if social sharing previews are important.',$next);if(in_array('onpage',$audits,true)&&!$p['og_description_present'])$add('Review','Open Graph description not detected','Add an appropriate og:description for social sharing previews where useful.',$next);if(in_array('onpage',$audits,true)&&$p['missing_alt'])$add('Medium','Images missing alt text',$p['missing_alt'].' image(s) have empty or missing alt attributes. Add descriptive alt text where images convey meaning.',$next);if(in_array('content',$audits,true)&&$p['text_length']<300)$add('Review','Low visible text volume','The extracted page text is relatively short. Check whether the page fully answers its intended user need.',$next);if(in_array('content',$audits,true)&&$p['text_length']>=300&&$p['text_length']<800)$add('Info','Content depth review','Review whether the page answers the visitor’s main questions. Word count alone is not a quality or ranking signal.',$next);if(in_array('technical',$audits,true)&&$p['internal_links']===0)$add('Review','No internal links detected','Consider relevant internal links to help visitors and crawlers discover related pages.',$next);foreach($p['links'] as $l){$linkIdentity=$this->page_identity($l);if(!isset($seen[$linkIdentity])&&!isset($queued[$linkIdentity])&&count($queue)<min(1500,max(30,$scanLimit*3))){$queue[]=$l;$queued[$linkIdentity]=true;$depthMap[$l]=($depthMap[$next]??0)+1;}}}
+    // Broken-link checker: check up to 60 unique destinations found in the crawled HTML.
+    if(in_array('technical',$audits,true)){
+      $destinations=[];foreach($pages as $pg){foreach(($pg['link_details']??[]) as $ld){$dest=$ld['url'];if(!isset($destinations[$dest]))$destinations[$dest]=$ld;}}
+      $checked=0;$brokenDestinations=[];$redirectCount=0;$inconclusive=0;$confirmedClientErrors=0;
+      foreach($destinations as $dest=>$ld){if($checked>=60)break;$checked++;$result=$this->check_link_status($dest);$sources=[];foreach($pages as $sourcePage){foreach(($sourcePage['link_details']??[]) as $sourceLink){if(($sourceLink['url']??'')===$dest){$sources[]=['source'=>$sourceLink['source']??($sourcePage['url']??''),'anchor'=>$sourceLink['anchor']??''];}}}$sourceUrls=array_values(array_unique(array_filter(array_column($sources,'source'))));$sourceLabel=$sourceUrls?implode(', ',$sourceUrls):($ld['source']??$url);$anchorLabels=array_values(array_unique(array_filter(array_column($sources,'anchor'))));$anchorLabel=$anchorLabels?implode(', ',array_slice($anchorLabels,0,3)):'(no anchor text)';
+        if(is_wp_error($result)){$inconclusive++;$msg=$result->get_error_message();if(strpos($msg,'UNSAFE:')===0)continue;$add('Info','Link status inconclusive',$msg.' Destination: '.$dest.'; source page(s): '.$sourceLabel.'.',($sourceUrls[0]??$rootUrl));continue;}
+        $code=(int)$result['status'];if(in_array($code,[401,403,429],true)){$inconclusive++;$add('Info','Link access restricted','Destination returned HTTP '.$code.'; access controls or rate limiting prevent confirmation. Destination: '.$dest.'; source page(s): '.$sourceLabel.'.',($sourceUrls[0]??$rootUrl));}
+        elseif($code===404||$code===410){$brokenDestinations[$dest]=['code'=>$code,'sources'=>$sourceLabel,'anchors'=>$anchorLabel];$add('Medium','Broken link detected','Destination returned HTTP '.$code.'. Destination: '.$dest.'. Anchor text: '.$anchorLabel.'. Source page(s): '.$sourceLabel.'.',($sourceUrls[0]??$rootUrl));}
+        elseif($code>=500){$inconclusive++;$add('Warning','Link destination server error','Destination returned HTTP '.$code.'. Recheck later before treating it as a persistent broken link. Destination: '.$dest.'; source page(s): '.$sourceLabel.'.',($sourceUrls[0]??$rootUrl));}
+        elseif($code>=400){$confirmedClientErrors++;$add('Review','Link destination returned client error','Destination returned HTTP '.$code.'. Verify whether the resource is intentionally restricted. Destination: '.$dest.'; source page(s): '.$sourceLabel.'.',($sourceUrls[0]??$rootUrl));}
+        elseif(!empty($result['redirected'])){$redirectCount++;if(!empty($result['redirect_chain']))$add('Review','Link redirects','Destination redirects to '.$result['final_url'].'. Consider updating the source link to the final destination if appropriate. Original destination: '.$dest.'; source page(s): '.$sourceLabel.'.',($sourceUrls[0]??$rootUrl));}
+      }
+      if(count($destinations)>60)$add('Info','Broken link check limit reached','Checked '.$checked.' unique link destinations; '.(count($destinations)-60).' additional destinations were not checked in this scan.',$url);
+      $add('Info','Broken link check summary','Checked '.$checked.' unique destinations out of '.count($destinations).' discovered; '.count($brokenDestinations).' confirmed 404/410 destinations; '.$confirmedClientErrors.' other HTTP 4xx destinations; '.$redirectCount.' redirected; '.$inconclusive.' inconclusive. Each confirmed 404/410 destination is listed once, with source page(s) included. Destinations beyond the 60-link limit were not tested and must not be treated as healthy or broken. Results can vary with anti-bot protections and temporary network failures.',$url);
     }
-
-    public function register_settings() {
-        register_setting('ctc_audit_group', self::OPT_PSI_KEY, ['type' => 'string', 'sanitize_callback' => 'sanitize_text_field', 'default' => '']);
-        register_setting('ctc_audit_group', self::OPT_MONITOR_ENABLED, [
-            'type' => 'boolean',
-            'sanitize_callback' => function($v) {
-                $enabled = (bool)$v;
-                if ($enabled && !wp_next_scheduled('ctca_daily_monitor')) {
-                    wp_schedule_event(time() + DAY_IN_SECONDS, 'ctca_daily', 'ctca_daily_monitor');
-                } elseif (!$enabled) {
-                    wp_clear_scheduled_hook('ctca_daily_monitor');
-                }
-                return $enabled;
-            },
-            'default' => false
-        ]);
-        register_setting('ctc_audit_group', self::OPT_BRAND_NAME, ['type' => 'string', 'sanitize_callback' => 'sanitize_text_field', 'default' => 'Creative Tech Coderz']);
-        register_setting('ctc_audit_group', self::OPT_BRAND_LOGO, ['type' => 'string', 'sanitize_callback' => 'esc_url_raw', 'default' => '']);
-        register_setting('ctc_audit_group', self::OPT_CONTACT_EMAIL, ['type' => 'string', 'sanitize_callback' => 'sanitize_email', 'default' => get_option('admin_email')]);
+    // Detect repeated titles and descriptions across crawled pages.
+    $titleMap=[];$descMap=[];foreach($pages as $page){$tk=mb_strtolower(trim($page['title']));$dk=mb_strtolower(trim($page['description']));if($tk!=='')$titleMap[$tk][]=$page['url'];if($dk!=='')$descMap[$dk][]=$page['url'];}foreach($titleMap as $title=>$urls)if(count($urls)>1){foreach($urls as $duplicateUrl)$add('Medium','Duplicate page title','The same title appears on '.count($urls).' crawled pages. This page shares its title with: '.implode(', ',array_slice(array_values(array_diff($urls,[$duplicateUrl])),0,3)).'. Use distinct titles where page intent differs.',$duplicateUrl);}foreach($descMap as $desc=>$urls)if(count($urls)>1){foreach($urls as $duplicateUrl)$add('Review','Duplicate meta description','The same meta description appears on '.count($urls).' crawled pages. This page shares its description with: '.implode(', ',array_slice(array_values(array_diff($urls,[$duplicateUrl])),0,3)).'. Make descriptions specific where useful.',$duplicateUrl);}
+    if(in_array('technical',$audits,true)){ $depths=[];$incoming=[];foreach($pages as $pg){$depths[$pg['url']]=$depthMap[$pg['url']]??0;foreach(($pg['links']??[]) as $to)$incoming[$to]=($incoming[$to]??0)+1;}foreach($depths as $pgUrl=>$depth)if($depth>=3)$add('Review','Deep crawl depth','This page was discovered at depth '.$depth.' from the submitted start URL. Consider whether important pages can be reached in fewer internal clicks. Crawl depth is estimated from the limited crawl.',$pgUrl);$unlinked=[];foreach($pages as $pg)if($pg['url']!==$url&&empty($incoming[$pg['url']]))$unlinked[]=$pg['url'];if($unlinked)$add('Review','Potential orphan / weakly linked pages','Among pages discovered in this limited crawl, '.count($unlinked).' page(s) had no incoming internal links from the crawled set. This is not a complete orphan-page audit because sitemap, external and uncrawled links may exist. Examples: '.implode(', ',array_slice($unlinked,0,6)),$url);else $add('Info','Orphan-page discovery limitation','No orphan pages were identified within the crawled set. Pages not linked from the start page and not discovered through crawled links may remain invisible; sitemap and full-site crawl data are needed for comprehensive discovery.',$url); }
+    if(in_array('technical',$audits,true)){$origin=wp_parse_url($url,PHP_URL_SCHEME).'://'.wp_parse_url($url,PHP_URL_HOST);$robotsUrl=$origin.'/robots.txt';$robots=$this->fetch_text_resource($robotsUrl,200000);if(is_wp_error($robots)){$add('Review','robots.txt could not be verified',$robots->get_error_message(),$robotsUrl);}else{if(trim($robots['body'])==='')$add('Review','robots.txt is empty','Confirm whether crawler directives are needed; an empty file is not automatically an error.',$robotsUrl);if(preg_match('/^\s*Sitemap:\s*(https?:\/\/\S+)/im',$robots['body'],$sm))$candidates=[trim($sm[1])];else $candidates=[$origin.'/wp-sitemap.xml',$origin.'/sitemap_index.xml',$origin.'/sitemap.xml'];$sitemapUrl='';$sitemapError='';foreach(array_unique($candidates) as $candidate){$sitemapTry=$this->fetch_text_resource($candidate,500000);if(!is_wp_error($sitemapTry)&&(stripos($sitemapTry['body'],'<urlset')!==false||stripos($sitemapTry['body'],'<sitemapindex')!==false)){$sitemapUrl=$candidate;$sitemap=$sitemapTry;break;}$sitemapError=is_wp_error($sitemapTry)?$sitemapTry->get_error_message():'Response did not contain a standard urlset or sitemapindex element.';}if($sitemapUrl==='')$add('Review','XML sitemap could not be verified','No valid sitemap was confirmed. Checked: '.implode(', ',$candidates).'. Last result: '.$sitemapError,$origin.'/robots.txt');else $add('Info','XML sitemap detected','A sitemap response was found. Checking a bounded sample of listed URLs against live HTTP responses; this does not verify Search Console submission or indexation.',$sitemapUrl);if($sitemapUrl!==''){$xmlBody=$sitemap['body'];$locs=[];$parseLocs=function($xml){$found=[];if(!class_exists('DOMDocument'))return $found;$old=libxml_use_internal_errors(true);$doc=new DOMDocument();if($doc->loadXML($xml, LIBXML_NONET|LIBXML_NOBLANKS)){ $xp=new DOMXPath($doc);foreach($xp->query('//*[local-name()="loc"]') as $node){$v=trim($node->textContent);if($v!=='')$found[]=$v;} }libxml_clear_errors();libxml_use_internal_errors($old);return $found;};$rootLocs=$parseLocs($xmlBody);if(stripos($xmlBody,'sitemapindex')!==false){foreach(array_slice($rootLocs,0,5) as $childMap){$childMap=html_entity_decode(trim($childMap),ENT_QUOTES|ENT_XML1,'UTF-8');if(!$this->safe_url($childMap))continue;$child=$this->fetch_text_resource($childMap,500000);if(!is_wp_error($child)&&stripos($child['body'],'urlset')!==false){$locs=array_merge($locs,$parseLocs($child['body']));}}}else{$locs=$rootLocs;}$locs=array_values(array_unique(array_slice(array_map(function($v){return html_entity_decode(trim(strip_tags($v)),ENT_QUOTES|ENT_XML1,'UTF-8');},$locs),0,10)));$checkedSitemap=0;$badSitemap=0;foreach($locs as $sLoc){if(!$this->safe_url($sLoc)){$badSitemap++;$add('Warning','Invalid or unsafe sitemap URL','A sitemap loc entry is not a permitted public HTTP(S) URL: '.$sLoc,$sitemapUrl);continue;}$sr=$this->check_link_status($sLoc);$checkedSitemap++;if(is_wp_error($sr)){$add('Info','Sitemap URL response inconclusive',$sr->get_error_message().' URL: '.$sLoc,$sitemapUrl);}elseif((int)$sr['status']>=400){$badSitemap++;$add('High','Sitemap URL returned HTTP error','Sitemap-listed URL returned HTTP '.$sr['status'].'. Confirm it should be in the sitemap.',$sLoc);}elseif(!empty($sr['redirected']))$add('Review','Sitemap URL redirects','Sitemap-listed URL redirects to '.$sr['final_url'].'. Prefer listing the final canonical URL when appropriate.',$sLoc);} $add($badSitemap?'Review':'Info','Sitemap URL response validation','Checked '.$checkedSitemap.' sitemap URL(s) from a maximum sample of 10; '.$badSitemap.' invalid or HTTP-error URL(s) found. Large sitemap indexes are sampled only, and anti-bot/rate limits can make results inconclusive.',$sitemapUrl);}}}
+    if(in_array('speed',$audits,true)&&get_option(self::OPT,'')){foreach(['mobile','desktop'] as $strategy){$api='https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url='.rawurlencode($url).'&strategy='.$strategy.'&category=performance&category=seo&key='.rawurlencode(get_option(self::OPT,''));$pr=$this->safe_remote_get($api,['timeout'=>25,'redirection'=>0,'limit_response_size'=>1000000,'headers'=>['Accept'=>'application/json']]);if(!is_wp_error($pr)&&wp_remote_retrieve_response_code($pr)===200){$j=json_decode(wp_remote_retrieve_body($pr),true);$cats=$j['lighthouseResult']['categories']??[];$perf=$cats['performance']['score']??null;$seo=$cats['seo']['score']??null;$ad=$j['lighthouseResult']['audits']??[];$lcp=$ad['largest-contentful-paint']['displayValue']??'not available';$cls=$ad['cumulative-layout-shift']['displayValue']??'not available';$inp=$ad['interaction-to-next-paint']['displayValue']??($ad['experimental-interaction-to-next-paint']['displayValue']??'not available');$fcp=$ad['first-contentful-paint']['displayValue']??'not available';$tbt=$ad['total-blocking-time']['displayValue']??'not available';$field=$j['loadingExperience']['metrics']??[];$fieldLcp=$field['LARGEST_CONTENTFUL_PAINT_MS']['percentile']??null;$fieldInp=$field['INTERACTION_TO_NEXT_PAINT']['percentile']??null;$fieldCls=$field['CUMULATIVE_LAYOUT_SHIFT_SCORE']['percentile']??null;$fieldAvailable=($fieldLcp!==null||$fieldInp!==null||$fieldCls!==null);$fieldSummary='Real-user field data '.($fieldAvailable?'partially available':'unavailable').': LCP '.($fieldLcp===null?'not returned':round($fieldLcp).' ms').'; INP '.($fieldInp===null?'not returned':round($fieldInp).' ms').'; CLS '.($fieldCls===null?'not returned':number_format($fieldCls/100,3)).'.';$labScore=$perf===null?'not returned':round($perf*100).'/100';$seoScore=$seo===null?'not returned':round($seo*100).'/100';$add('Info','Google PageSpeed Insights — '.ucfirst($strategy),'PageSpeed API request succeeded. Lighthouse lab results: performance score '.$labScore.'; SEO score '.$seoScore.'; LCP '.$lcp.'; CLS '.$cls.'; INP '.$inp.'; FCP '.$fcp.'; TBT '.$tbt.'. '.$fieldSummary.' Missing field data is not a performance failure. Lab and field metrics are different; field data may be unavailable for low-traffic URLs. A score is shown only when the API returns one.',$url);}else{$status=is_wp_error($pr)?$pr->get_error_message():'HTTP '.wp_remote_retrieve_response_code($pr);$body=!is_wp_error($pr)?json_decode(wp_remote_retrieve_body($pr),true):[];$apiMessage=$body['error']['message']??$status;$add('Warning','PageSpeed '.$strategy.' data unavailable','The PageSpeed request failed: '.sanitize_text_field((string)$apiMessage).'. Check API enablement, key restrictions, quota and target URL.',$url);}}}elseif(in_array('speed',$audits,true))$add('Info','PageSpeed API not configured','This installation has not configured a Google PageSpeed Insights API key, so speed scores were not run. Add a key under Settings → CTC Website Audit.',$url);
+    // Six-area checklist: additional HTML-observable signals (no external AI rank claims).
+    foreach($pages as $pg){$pageUrl=$pg['url'];
+      if(in_array('onpage',$audits,true)){
+        if(empty($pg['html_lang']))$add('Review','On-page language signal missing','The HTML lang attribute was not detected. Set the correct language for the page.',$pageUrl);
+        if(empty($pg['og_title_present']))$add('Low','Open Graph title missing','Add a descriptive og:title if social sharing previews are relevant.',$pageUrl);
+        if(empty($pg['og_description_present']))$add('Low','Open Graph description missing','Add a useful og:description for social previews where relevant.',$pageUrl);
+        if(!empty($pg['canonical_count'])&&count($pg['canonicals'])>1)$add('High','Conflicting canonical URLs','More than one distinct canonical href was found on this page.',$pageUrl);
+        if(!empty($pg['link_details'])){ $generic=[]; foreach($pg['link_details'] as $ld){$a=mb_strtolower(trim($ld['anchor']??''));if(in_array($a,['click here','read more','here','learn more'],true))$generic[]=$a;} if(count($generic)>=3)$add('Review','Generic internal/external link anchors','Found '.count($generic).' generic anchor text instance(s) in the checked links. Use descriptive text where it helps users understand the destination.',$pageUrl); }
+      }
+      if(in_array('content',$audits,true)){
+        if(($pg['text_length']??0)<300)$add('Review','Low extracted content volume','Only '.intval($pg['text_length']??0).' characters of text were extracted from the fetched HTML. Review whether the page fully satisfies its purpose; length alone is not a quality score.',$pageUrl);
+        if(($pg['text_length']??0)>=300 && ($pg['text_length']??0)<800)$add('Info','Content depth review','Extracted text is between 300 and 800 characters. Review topic coverage, usefulness and visitor intent; word count alone is not a ranking factor.',$pageUrl);
+        if(empty($pg['main_region_present']))$add('Review','Main content landmark not detected','No main element or role=main was detected in the raw HTML. Confirm the primary content is clearly structured and available to crawlers.',$pageUrl);
+        // The main on-page audit already reports a missing H1; do not emit a duplicate content-category finding.
+      }
+      if(in_array('ai',$audits,true)){
+        if(empty($pg['jsonld_blocks']))$add('Review','Structured data signal for AI readiness','No JSON-LD block was detected. Consider relevant, accurate structured data where appropriate; it is not a guarantee of AI citations.',$pageUrl);
+        if(empty($pg['description']))$add('Review','Concise page summary missing','A meta description was not detected. Add a useful page summary where appropriate; search and AI systems may generate their own summaries.',$pageUrl);
+        if(($pg['text_length']??0)<300)$add('Review','Limited extractable answer content','The fetched HTML contains relatively little text for answer extraction. Check rendered content, clear definitions, question-led sections and factual support.',$pageUrl);
+      }
+      if(in_array('local',$audits,true)){
+        if(empty($pg['jsonld_blocks']))$add('Review','Local structured-data signal not detected','No JSON-LD block was found. If this is a local business page, review whether accurate LocalBusiness or Organization markup is appropriate.',$pageUrl);
+        if(empty($pg['html_lang']))$add('Low','Language declaration missing','Declare the page language using the HTML lang attribute.',$pageUrl);
+        $localText=''; if(!empty($pg['title']))$localText.=$pg['title'].' '; if(!empty($pg['description']))$localText.=$pg['description'];
+        if($pageUrl===$url&&!preg_match('/\b(address|contact|phone|telephone|location|hours|opening hours)\b/i',$localText))$add('Info','Local contact information needs manual review','The homepage title and meta description do not visibly mention contact, address, phone, location or hours. This metadata-only signal cannot confirm whether these details appear in the page body; review the homepage and business profile manually.',$pageUrl);
+      }
     }
-
-    public function scheduled_monitor() {
-        if (!get_option(self::OPT_MONITOR_ENABLED, false)) {
-            return;
-        }
-        $url = home_url('/');
-        $req = new WP_REST_Request('POST', '/ctc-audit/v1/scan');
-        $req->set_param('url', $url);
-        $req->set_param('audits', ['technical', 'onpage', 'ai', 'local', 'content', 'speed']);
-        $req->set_param('scan_limit', 5);
-        try {
-            $this->scan_legacy($req);
-        } catch (\Throwable $e) {
-            // Keep silent in cron to avoid server hangs
-        }
-    }
-
-    private function get_client_ip() {
-        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-            $ip = sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);
-            if (filter_var($ip, FILTER_VALIDATE_IP)) return $ip;
-        }
-        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-            $list = explode(',', (string)$_SERVER['HTTP_X_FORWARDED_FOR']);
-            $first = trim($list[0]);
-            if (filter_var($first, FILTER_VALIDATE_IP)) return $first;
-        }
-        return sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1');
-    }
-
-    /**
-     * Enterprise URL Validation & SSRF Defense.
-     * Validates scheme, port, and resolves DNS to block private, loopback, and cloud metadata IPs.
-     */
-    public function safe_url($url) {
-        $url = esc_url_raw(trim((string)$url));
-        if (!$url || !wp_http_validate_url($url)) return false;
-        $p = wp_parse_url($url);
-        if (empty($p['scheme']) || !in_array(strtolower($p['scheme']), ['http', 'https'], true)) return false;
-        if (empty($p['host']) || isset($p['user']) || isset($p['pass'])) return false;
-
-        if (isset($p['port'])) {
-            $port = (int)$p['port'];
-            if (strtolower($p['scheme']) === 'http' && $port !== 80) return false;
-            if (strtolower($p['scheme']) === 'https' && $port !== 443) return false;
-        }
-
-        $host = strtolower(trim(rtrim($p['host'], '.'), '[]'));
-        if ($host === 'localhost' || substr($host, -6) === '.local' || substr($host, -10) === '.localhost') return false;
-
-        // SSRF: Check if literal IP
-        if (filter_var($host, FILTER_VALIDATE_IP)) {
-            if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-                return false;
-            }
-        } else {
-            // SSRF: Resolve DNS and verify all returned A / AAAA records are public
-            $records = @dns_get_record($host, DNS_A | DNS_AAAA);
-            if (is_array($records) && !empty($records)) {
-                foreach ($records as $rec) {
-                    $ip = $rec['ip'] ?? ($rec['ipv6'] ?? '');
-                    if ($ip && !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-                        return false;
-                    }
-                }
-            } else {
-                $resolved = @gethostbyname($host);
-                if ($resolved && $resolved !== $host) {
-                    if (!filter_var($resolved, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        return $url;
-    }
-
-    public function page_identity($url) {
-        $url = trim((string)$url);
-        $parts = wp_parse_url($url);
-        if (!$parts || empty($parts['host'])) return strtolower($url);
-
-        $scheme = strtolower($parts['scheme'] ?? 'https');
-        $host   = strtolower(rtrim($parts['host'], '.'));
-        $port   = isset($parts['port']) ? (int)$parts['port'] : null;
-        if (($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80)) $port = null;
-
-        $path = $parts['path'] ?? '/';
-        if ($path === '') $path = '/';
-
-        $query = [];
-        if (!empty($parts['query'])) {
-            parse_str($parts['query'], $params);
-            foreach ($params as $k => $v) {
-                $lk = strtolower((string)$k);
-                if (strpos($lk, 'utm_') === 0 || in_array($lk, ['gclid', 'fbclid', 'msclkid', 'yclid', '_ga'], true)) {
-                    continue;
-                }
-                $query[$k] = $v;
-            }
-            ksort($query);
-        }
-
-        $identity = $scheme . '://' . $host . ($port ? ':' . $port : '') . $path;
-        if (!empty($query)) {
-            $identity .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
-        }
-        return $identity;
-    }
-
-    /**
-     * Outbound HTTP Request Engine.
-     * Enforces sslverify => true, bounded timeouts, and public validation.
-     */
-    public function safe_remote_get($url, $args = []) {
-        $safe = $this->safe_url($url);
-        if (!$safe) return new WP_Error('unsafe_resource', 'URL failed public security and SSRF validation.');
-
-        $timeout = max(2, min(8, (int)($args['timeout'] ?? 5)));
-        $headers = (array)($args['headers'] ?? []);
-
-        $wp_args = [
-            'timeout'     => $timeout,
-            'redirection' => 0,
-            'user-agent'  => 'CTC-Website-Audit/' . CTC_AUDIT_VERSION . ' (+' . home_url('/') . ')',
-            'headers'     => $headers,
-            'sslverify'   => true, // Security: Strict TLS certificate validation enabled
-        ];
-
-        $response = wp_remote_get($safe, $wp_args);
-        if (is_wp_error($response)) {
-            return $response;
-        }
-
-        $code = (int)wp_remote_retrieve_response_code($response);
-        $body = wp_remote_retrieve_body($response);
-        $raw_headers = wp_remote_retrieve_headers($response);
-        $resp_headers = [];
-        foreach ($raw_headers as $k => $v) {
-            $resp_headers[strtolower((string)$k)] = is_array($v) ? implode(', ', $v) : (string)$v;
-        }
-
-        return [
-            'headers'  => $resp_headers,
-            'response' => ['code' => $code, 'message' => ''],
-            'body'     => $body,
-        ];
-    }
-
-    public function fetch_page($url) {
-        $safe = $this->safe_url($url);
-        if (!$safe) return new WP_Error('bad_url', 'URL is invalid or points to an internal/private address.');
-        $current = $safe;
-
-        for ($hop = 0; $hop <= 2; $hop++) {
-            $current = $this->safe_url($current);
-            if (!$current) return new WP_Error('unsafe_redirect', 'Redirect target was blocked by SSRF validation.');
-
-            $r = $this->safe_remote_get($current, [
-                'timeout' => 5,
-                'headers' => ['Accept' => 'text/html,application/xhtml+xml'],
-            ]);
-            if (is_wp_error($r)) return $r;
-
-            $code = (int)($r['response']['code'] ?? 0);
-            if (in_array($code, [301, 302, 303, 307, 308], true)) {
-                $loc = $r['headers']['location'] ?? '';
-                if (!$loc || $hop === 2) return new WP_Error('redirect_limit', 'Too many redirects.');
-                if (strpos($loc, '//') === 0) {
-                    $loc = wp_parse_url($current, PHP_URL_SCHEME) . ':' . $loc;
-                } elseif (strpos($loc, '/') === 0) {
-                    $loc = wp_parse_url($current, PHP_URL_SCHEME) . '://' . wp_parse_url($current, PHP_URL_HOST) . $loc;
-                } elseif (!wp_http_validate_url($loc)) {
-                    $base   = wp_parse_url($current);
-                    $origin = $base['scheme'] . '://' . $base['host'] . (isset($base['port']) ? ':' . $base['port'] : '');
-                    if (strpos($loc, '?') === 0) {
-                        $loc = ($base['path'] ?? '/') . $loc;
-                    } else {
-                        $loc = trailingslashit(dirname($base['path'] ?? '/')) . $loc;
-                    }
-                    $loc = $origin . '/' . ltrim(preg_replace('#/\./#', '/', $loc), '/');
-                }
-                $current = $loc;
-                continue;
-            }
-
-            if ($code < 200 || $code >= 300) return new WP_Error('fetch_failed', 'Page returned HTTP ' . $code);
-            $body = $r['body'] ?? '';
-            $ctype = $r['headers']['content-type'] ?? '';
-            if ($ctype !== '' && stripos($ctype, 'text/html') === false) {
-                return new WP_Error('not_html', 'URL did not return HTML content.');
-            }
-
-            return [
-                'body'      => $body,
-                'code'      => $code,
-                'headers'   => $r['headers'] ?? [],
-                'final_url' => $current,
-            ];
-        }
-        return new WP_Error('redirect_limit', 'Too many redirects.');
-    }
-
-    public function fetch_text_resource($url, $limit = 100000) {
-        $safe = $this->safe_url($url);
-        if (!$safe) return new WP_Error('unsafe_resource', 'Resource URL failed security validation.');
-        $r = $this->safe_remote_get($safe, ['timeout' => 4, 'headers' => ['Accept' => 'text/plain, application/xml, text/xml, */*']]);
-        if (is_wp_error($r)) return $r;
-        $code = (int)($r['response']['code'] ?? 0);
-        if ($code < 200 || $code >= 300) return new WP_Error('resource_http', 'Resource returned HTTP ' . $code);
-        return ['body' => substr($r['body'], 0, $limit), 'code' => $code];
-    }
-
-    public function check_link_status($url) {
-        $current = $this->safe_url($url);
-        if (!$current) return new WP_Error('unsafe_link', 'Target URL failed security validation.');
-        $r = $this->safe_remote_get($current, ['timeout' => 3, 'headers' => ['Accept' => 'text/html,*/*']]);
-        if (is_wp_error($r)) return new WP_Error('link_unreachable', $r->get_error_message());
-        $code = (int)($r['response']['code'] ?? 0);
-        $loc  = $r['headers']['location'] ?? '';
-        return [
-            'status'     => $code,
-            'final_url'  => $loc ? $loc : $current,
-            'redirected' => in_array($code, [301, 302, 303, 307, 308], true),
-        ];
-    }
-
-    public function parse_page($url, $body, $headers = []) {
-        if (!class_exists('DOMDocument')) {
-            return [
-                'url' => $url, 'title' => '', 'description' => '', 'robots' => '',
-                'h1' => 0, 'headings_count' => 0, 'skipped_headings' => 0, 'empty_headings' => 0,
-                'canonical' => '', 'canonical_count' => 0, 'canonicals' => [],
-                'canonical_missing' => true, 'canonical_external' => false,
-                'images' => 0, 'missing_alt' => 0, 'missing_image_dims' => 0, 'legacy_image_formats' => 0,
-                'text_length' => strlen(strip_tags($body)), 'word_count' => str_word_count(strip_tags($body)),
-                'internal_links' => 0, 'external_links' => 0, 'links_nofollow_internal' => 0, 'external_unsafe_targets' => 0, 'empty_links' => 0,
-                'viewport_present' => false, 'viewport_responsive' => false,
-                'html_lang' => '', 'hreflangs' => [],
-                'og_title_present' => false, 'og_description_present' => false, 'og_image_present' => false,
-                'twitter_card_present' => false, 'twitter_title_present' => false, 'twitter_image_present' => false,
-                'jsonld_blocks' => 0, 'jsonld_types' => [], 'jsonld_invalid' => 0,
-                'breadcrumbs_present' => false, 'author_byline_present' => false,
-                'question_headings' => 0, 'list_containers_count' => 0,
-                'render_blocking_scripts' => 0,
-                'mixed_content' => [], 'main_region_present' => false,
-                'hsts_present' => !empty($headers['strict-transport-security']),
-                'x_frame_options' => $headers['x-frame-options'] ?? '',
-                'csp_present' => !empty($headers['content-security-policy']),
-                'nosniff_present' => !empty($headers['x-content-type-options']) && stripos($headers['x-content-type-options'], 'nosniff') !== false,
-                'x_robots_tag' => $headers['x-robots-tag'] ?? '',
-                'header_canonical' => '',
-                'links' => [], 'link_details' => [],
-            ];
-        }
-
-        libxml_use_internal_errors(true);
-        $dom = new DOMDocument();
-        $dom->loadHTML('<?xml encoding="utf-8" ?>' . $body);
-        $xp = new DOMXPath($dom);
-
-        $cleanText = trim(preg_replace('/\s+/u', ' ', strip_tags($body)));
-        $wordCount = str_word_count(strip_tags($body));
-
-        $title       = trim($xp->evaluate('string(//title)'));
-        $description = trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="description"]/@content)'));
-        $robots      = trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="robots"]/@content)'));
-        $viewport    = trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="viewport"]/@content)'));
-        $lang        = trim($xp->evaluate('string(//html/@lang)'));
-        $ogTitle     = trim($xp->evaluate('string(//meta[translate(@property,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="og:title"]/@content)'));
-        $ogDesc      = trim($xp->evaluate('string(//meta[translate(@property,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="og:description"]/@content)'));
-        $ogImage     = trim($xp->evaluate('string(//meta[translate(@property,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="og:image"]/@content)'));
-
-        $twCard      = trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="twitter:card"]/@content)'));
-        $twTitle     = trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="twitter:title"]/@content)'));
-        $twImage     = trim($xp->evaluate('string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="twitter:image"]/@content)'));
-
-        // HTTP Header Canonicals
-        $headerCanonical = '';
-        if (!empty($headers['link'])) {
-            if (stripos($headers['link'], 'canonical') !== false && preg_match('~<([^>]+)>~', $headers['link'], $m)) {
-                $headerCanonical = trim($m[1]);
-            }
-        }
-
-        $htmlCanonicalNodes = $xp->query('//link[contains(concat(" ", normalize-space(translate(@rel,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")), " ") , " canonical ")]');
-        $canonicals = [];
-        if ($htmlCanonicalNodes) {
-            foreach ($htmlCanonicalNodes as $cn) {
-                $cv = trim($cn->getAttribute('href'));
-                if ($cv !== '') $canonicals[] = $cv;
-            }
-        }
-        if ($headerCanonical !== '') {
-            $canonicals[] = $headerCanonical;
-        }
-        $canonicals       = array_values(array_unique($canonicals));
-        $canonicalCount   = count($canonicals);
-        $primaryCanonical = $canonicals[0] ?? '';
-        $host             = strtolower((string)wp_parse_url($url, PHP_URL_HOST));
-        $canonicalHost    = strtolower((string)wp_parse_url($primaryCanonical, PHP_URL_HOST));
-
-        // Hreflang extraction
-        $hreflangs = [];
-        $hlNodes = $xp->query('//link[contains(concat(" ", normalize-space(translate(@rel,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")), " ") , " alternate ") and @hreflang]');
-        if ($hlNodes) {
-            foreach ($hlNodes as $hNode) {
-                $hlVal = strtolower(trim($hNode->getAttribute('hreflang')));
-                if ($hlVal !== '') $hreflangs[] = $hlVal;
-            }
-        }
-
-        // Headings Structure & Quality
-        $h1Count = (int)$xp->query('//h1')->length;
-        $hNodes  = $xp->query('//h1 | //h2 | //h3 | //h4 | //h5 | //h6');
-        $skippedHeadingLevels = 0;
-        $emptyHeadings = 0;
-        $questionHeadings = 0;
-        $lastLevel = 0;
-
-        foreach ($hNodes as $node) {
-            $lvl = (int)substr(strtolower($node->tagName), 1);
-            $hText = trim(preg_replace('/\s+/u', ' ', $node->textContent));
-            if ($hText === '') {
-                $emptyHeadings++;
-            }
-            if ($lastLevel > 0 && $lvl > ($lastLevel + 1)) {
-                $skippedHeadingLevels++;
-            }
-            if (preg_match('/^(how|what|why|where|when|who|can|which|is|are|will)\b/i', $hText) || strpos($hText, '?') !== false) {
-                $questionHeadings++;
-            }
-            $lastLevel = $lvl;
-        }
-
-        // Images: Alt Text, Dimensions (CLS), Formats
-        $images = $xp->query('//img');
-        $missingAlt  = 0;
-        $missingDims = 0;
-        $legacyFormats = 0;
-        foreach ($images as $im) {
-            if (trim($im->getAttribute('alt')) === '') $missingAlt++;
-            $w = trim($im->getAttribute('width'));
-            $h = trim($im->getAttribute('height'));
-            if ($w === '' || $h === '') $missingDims++;
-            $src = trim($im->getAttribute('src'));
-            if (preg_match('/\.(png|jpg|jpeg)($|\?)/i', $src)) {
-                $legacyFormats++;
-            }
-        }
-
-        // Render-blocking scripts in <head>
-        $rbScripts = (int)$xp->query('//head/script[@src and not(@async) and not(@defer) and not(@type="module")]')->length;
-
-        // Structured Data JSON-LD deep check
-        $jsonLdNodes = $xp->query('//script[translate(@type,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="application/ld+json"]');
-        $schemaTypes = [];
-        $invalidJsonLd = 0;
-        if ($jsonLdNodes) {
-            foreach ($jsonLdNodes as $jNode) {
-                $raw = trim($jNode->textContent);
-                if ($raw === '') continue;
-                $decoded = json_decode($raw, true);
-                if ($decoded === null) {
-                    $invalidJsonLd++;
-                } else {
-                    if (isset($decoded['@type'])) {
-                        $schemaTypes[] = is_array($decoded['@type']) ? implode('/', $decoded['@type']) : (string)$decoded['@type'];
-                    } elseif (isset($decoded['@graph']) && is_array($decoded['@graph'])) {
-                        foreach ($decoded['@graph'] as $gItem) {
-                            if (isset($gItem['@type'])) {
-                                $schemaTypes[] = is_array($gItem['@type']) ? implode('/', $gItem['@type']) : (string)$gItem['@type'];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        $schemaTypes = array_values(array_unique(array_filter($schemaTypes)));
-
-        // Breadcrumbs and Author / E-E-A-T signals
-        $hasBreadcrumbs = in_array('BreadcrumbList', $schemaTypes, true) || (int)$xp->query('//nav[contains(translate(@aria-label,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"breadcrumb") or contains(@class,"breadcrumb")]')->length > 0;
-        $hasAuthor = in_array('Person', $schemaTypes, true) || in_array('author', array_map('strtolower', $schemaTypes), true) || (int)$xp->query('//*[@rel="author" or contains(@class,"author") or contains(@itemprop,"author")]')->length > 0;
-        $listContainers = (int)$xp->query('//ul | //ol | //table')->length;
-
-        // Links & Anchors
-        $base   = wp_parse_url($url);
-        $origin = $base['scheme'] . '://' . $base['host'] . (isset($base['port']) ? ':' . $base['port'] : '');
-        $links       = [];
-        $linkDetails = [];
-        $internal    = 0;
-        $external    = 0;
-        $nofollowInternal = 0;
-        $externalUnsafe = 0;
-        $emptyLinks = 0;
-
-        foreach ($xp->query('//a[@href]') as $a) {
-            $href = trim($a->getAttribute('href'));
-            if (!$href || $href[0] === '#' || preg_match('/^(mailto:|tel:|javascript:|data:|sms:)/i', $href)) continue;
-
-            $anchorText = trim($a->textContent);
-            $hasChildImgAlt = false;
-            foreach ($a->getElementsByTagName('img') as $imgChild) {
-                if (trim($imgChild->getAttribute('alt')) !== '') {
-                    $hasChildImgAlt = true;
-                    break;
-                }
-            }
-            if ($anchorText === '' && !$hasChildImgAlt && trim($a->getAttribute('aria-label')) === '') {
-                $emptyLinks++;
-            }
-
-            if (strpos($href, '//') === 0) {
-                $abs = $base['scheme'] . ':' . $href;
-            } elseif (wp_http_validate_url($href)) {
-                $abs = $href;
-            } elseif (strpos($href, '/') === 0) {
-                $abs = $origin . $href;
-            } elseif (strpos($href, '?') === 0) {
-                $abs = ($base['path'] ?? '/') . $href;
-            } else {
-                $abs = trailingslashit(dirname($base['path'] ?? '/')) . $href;
-            }
-
-            $clean = esc_url_raw(preg_replace('/#.*$/', '', $abs));
-            if (!wp_http_validate_url($clean)) continue;
-
-            // Filter non-HTML asset files from crawling queue
-            if (preg_match('/\.(pdf|jpg|jpeg|png|gif|webp|svg|ico|zip|rar|tar|gz|exe|dmg|mp3|mp4|mov|avi|css|js|xml|json|woff|woff2|ttf|eot)(\?.*)?$/i', $clean)) {
-                continue;
-            }
-
-            $isInternal = strtolower((string)wp_parse_url($clean, PHP_URL_HOST)) === $host;
-            $rel = strtolower(trim($a->getAttribute('rel')));
-            $target = strtolower(trim($a->getAttribute('target')));
-
-            if ($isInternal) {
-                $internal++;
-                if (strpos($rel, 'nofollow') !== false) {
-                    $nofollowInternal++;
-                }
-            } else {
-                $external++;
-                if ($target === '_blank' && (strpos($rel, 'noopener') === false && strpos($rel, 'noreferrer') === false)) {
-                    $externalUnsafe++;
-                }
-            }
-
-            if (count($linkDetails) < 40) {
-                $linkDetails[] = [
-                    'url'      => $clean,
-                    'anchor'   => sanitize_text_field($anchorText),
-                    'internal' => $isInternal,
-                    'source'   => $url,
-                ];
-            }
-            if ($isInternal && count($links) < 20) {
-                $links[] = $clean;
-            }
-        }
-
-        $mainRegion  = (int)$xp->query('(//main|//*[@role="main"])[1]')->length > 0;
-        $viewportScale = ($viewport !== '' && stripos($viewport, 'width=device-width') !== false);
-
-        $mixed = [];
-        foreach ($xp->query('//*[@src or @href]') as $node) {
-            foreach (['src', 'href'] as $attr) {
-                $val = trim($node->getAttribute($attr));
-                if (stripos($val, 'http://') === 0) {
-                    $mixed[] = $val;
-                }
-            }
-        }
-
-        return [
-            'url'                     => $url,
-            'title'                   => $title,
-            'description'             => $description,
-            'robots'                  => $robots,
-            'h1'                      => $h1Count,
-            'headings_count'          => $hNodes->length,
-            'skipped_headings'        => $skippedHeadingLevels,
-            'empty_headings'          => $emptyHeadings,
-            'question_headings'       => $questionHeadings,
-            'canonical'               => $primaryCanonical,
-            'canonical_count'         => $canonicalCount,
-            'canonicals'              => $canonicals,
-            'canonical_missing'       => ($canonicalCount === 0),
-            'canonical_external'      => ($canonicalHost && $canonicalHost !== $host),
-            'header_canonical'        => $headerCanonical,
-            'images'                  => $images->length,
-            'missing_alt'             => $missingAlt,
-            'missing_image_dims'      => $missingDims,
-            'legacy_image_formats'    => $legacyFormats,
-            'render_blocking_scripts' => $rbScripts,
-            'text_length'             => mb_strlen($cleanText),
-            'word_count'              => $wordCount,
-            'internal_links'          => $internal,
-            'external_links'          => $external,
-            'links_nofollow_internal' => $nofollowInternal,
-            'external_unsafe_targets' => $externalUnsafe,
-            'empty_links'             => $emptyLinks,
-            'viewport_present'        => ($viewport !== ''),
-            'viewport_responsive'     => $viewportScale,
-            'html_lang'               => $lang,
-            'hreflangs'               => array_values(array_unique($hreflangs)),
-            'og_title_present'        => ($ogTitle !== ''),
-            'og_description_present'  => ($ogDesc !== ''),
-            'og_image_present'        => ($ogImage !== ''),
-            'twitter_card_present'    => ($twCard !== ''),
-            'twitter_title_present'   => ($twTitle !== ''),
-            'twitter_image_present'   => ($twImage !== ''),
-            'jsonld_blocks'           => $jsonLdNodes->length,
-            'jsonld_types'            => $schemaTypes,
-            'jsonld_invalid'          => $invalidJsonLd,
-            'breadcrumbs_present'     => $hasBreadcrumbs,
-            'author_byline_present'   => $hasAuthor,
-            'list_containers_count'   => $listContainers,
-            'mixed_content'           => array_values(array_unique($mixed)),
-            'main_region_present'     => $mainRegion,
-            'hsts_present'            => !empty($headers['strict-transport-security']),
-            'x_frame_options'         => $headers['x-frame-options'] ?? '',
-            'csp_present'             => !empty($headers['content-security-policy']),
-            'nosniff_present'         => !empty($headers['x-content-type-options']) && stripos($headers['x-content-type-options'], 'nosniff') !== false,
-            'x_robots_tag'            => $headers['x-robots-tag'] ?? '',
-            'links'                   => array_values(array_unique($links)),
-            'link_details'            => $linkDetails,
-        ];
-    }
-
-    /* -------------------------------------------------------------------------
-     * PROGRESSIVE BATCH ENGINE (ZERO GATEWAY TIMEOUT)
-     * ---------------------------------------------------------------------- */
-
-    public function scan_init($req) {
-        $ip = $this->get_client_ip();
-        $rateKey = 'ctca_rate_' . md5($ip);
-        if (get_transient($rateKey)) {
-            return new WP_Error('rate_limited', 'Please wait 30 seconds before initiating another audit.', ['status' => 429]);
-        }
-        set_transient($rateKey, 1, 30);
-
-        $url = $this->safe_url((string)$req->get_param('url'));
-        if (!$url) return new WP_Error('invalid_url', 'Enter a valid public HTTP or HTTPS website URL.', ['status' => 400]);
-
-        $requestedLimit = absint($req->get_param('scan_limit'));
-        if (!$requestedLimit) $requestedLimit = 5;
-        $scanLimit = min(20, max(1, $requestedLimit));
-        $audits = (array)$req->get_param('audits');
-        if (empty($audits)) $audits = ['technical', 'onpage', 'ai', 'local', 'content', 'speed'];
-
-        $sessionId = 'ctc_' . wp_generate_password(20, false);
-        $rootIdentity = $this->page_identity($url);
-
-        // Lightweight session state: NO raw HTML bodies stored!
-        $sessionData = [
-            'session_id'    => $sessionId,
-            'start_url'     => $url,
-            'root_host'     => strtolower((string)wp_parse_url($url, PHP_URL_HOST)),
-            'scan_limit'    => $scanLimit,
-            'audits'        => $audits,
-            'queue'         => [$url],
-            'depth_map'     => [$url => 0],
-            'queued'        => [$rootIdentity => true],
-            'seen'          => [],
-            'scan_attempts' => 0,
-            'pages'         => [],
-            'created_at'    => current_time('mysql'),
-        ];
-
-        set_transient('ctc_audit_sess_' . $sessionId, $sessionData, 20 * MINUTE_IN_SECONDS);
-
-        return rest_ensure_response([
-            'session_id' => $sessionId,
-            'url'        => $url,
-            'scan_limit' => $scanLimit,
-            'message'    => 'Scan initialized.',
-        ]);
-    }
-
-    public function scan_batch($req) {
-        $sessionId = sanitize_key((string)$req->get_param('session_id'));
-        $session = get_transient('ctc_audit_sess_' . $sessionId);
-        if (!$session || !is_array($session)) {
-            return new WP_Error('session_expired', 'Your audit session expired or is invalid. Please restart.', ['status' => 404]);
-        }
-
-        $batchSize = 3; // 3 pages per roundtrip = ~3-5 seconds (Far below 30s gateway limits!)
-        $processed = 0;
-        $queue     = &$session['queue'];
-        $seen      = &$session['seen'];
-        $queued    = &$session['queued'];
-        $depthMap  = &$session['depth_map'];
-        $pages     = &$session['pages'];
-        $rootHost  = $session['root_host'];
-        $scanLimit = (int)$session['scan_limit'];
-
-        while (!empty($queue) && $session['scan_attempts'] < $scanLimit && $processed < $batchSize) {
-            $next = array_shift($queue);
-            $next = $this->safe_url($next);
-            if (!$next) continue;
-
-            $identity = $this->page_identity($next);
-            unset($queued[$identity]);
-            if (isset($seen[$identity])) continue;
-            if (strtolower((string)wp_parse_url($next, PHP_URL_HOST)) !== $rootHost) continue;
-
-            $seen[$identity] = true;
-            $session['scan_attempts']++;
-            $processed++;
-            $currentDepth = $depthMap[$next] ?? 0;
-
-            $fetch = $this->fetch_page($next);
-            if (is_wp_error($fetch)) {
-                $pages[] = [
-                    'url'         => $next,
-                    'error'       => $fetch->get_error_message(),
-                    'text_length' => 0,
-                    'depth'       => $currentDepth,
-                ];
-                continue;
-            }
-
-            // Parse immediately and store ONLY lightweight metadata
-            $parsed = $this->parse_page($next, $fetch['body'], $fetch['headers'] ?? []);
-            $parsed['depth'] = $currentDepth;
-            unset($fetch); // Free memory immediately
-            $pages[] = $parsed;
-
-            foreach ($parsed['links'] as $l) {
-                $linkId = $this->page_identity($l);
-                if (!isset($seen[$linkId]) && !isset($queued[$linkId]) && count($queue) < 40) {
-                    $queue[]          = $l;
-                    $queued[$linkId]  = true;
-                    $depthMap[$l]     = $currentDepth + 1;
-                }
-            }
-        }
-
-        $isDone = empty($queue) || $session['scan_attempts'] >= $scanLimit;
-        set_transient('ctc_audit_sess_' . $sessionId, $session, 20 * MINUTE_IN_SECONDS);
-
-        return rest_ensure_response([
-            'session_id'    => $sessionId,
-            'pages_checked' => count($pages),
-            'scan_attempts' => $session['scan_attempts'],
-            'scan_limit'    => $scanLimit,
-            'in_queue'      => count($queue),
-            'is_finished'   => $isDone,
-        ]);
-    }
-
-    public function scan_finalize($req) {
-        $sessionId = sanitize_key((string)$req->get_param('session_id'));
-        $session = get_transient('ctc_audit_sess_' . $sessionId);
-        if (!$session || !is_array($session)) {
-            return new WP_Error('session_expired', 'Your audit session expired. Please restart.', ['status' => 404]);
-        }
-
-        $report = $this->compile_report($session);
-        delete_transient('ctc_audit_sess_' . $sessionId);
-        return rest_ensure_response($report);
-    }
-
-    public function scan_legacy($req) {
-        @ini_set('max_execution_time', '45');
-        @set_time_limit(45);
-
-        $url = $this->safe_url((string)$req->get_param('url'));
-        if (!$url) return new WP_Error('invalid_url', 'Enter a valid public HTTP or HTTPS website URL.', ['status' => 400]);
-
-        $scanLimit = min(10, max(1, absint($req->get_param('scan_limit') ?: 5)));
-        $audits = (array)($req->get_param('audits') ?: ['technical', 'onpage', 'ai', 'local', 'content', 'speed']);
-        $rootId = $this->page_identity($url);
-
-        $session = [
-            'start_url'     => $url,
-            'root_host'     => strtolower((string)wp_parse_url($url, PHP_URL_HOST)),
-            'scan_limit'    => $scanLimit,
-            'audits'        => $audits,
-            'queue'         => [$url],
-            'depth_map'     => [$url => 0],
-            'queued'        => [$rootId => true],
-            'seen'          => [],
-            'scan_attempts' => 0,
-            'pages'         => [],
-        ];
-
-        while (!empty($session['queue']) && $session['scan_attempts'] < $scanLimit) {
-            $next = array_shift($session['queue']);
-            $next = $this->safe_url($next);
-            if (!$next) continue;
-
-            $identity = $this->page_identity($next);
-            if (isset($session['seen'][$identity])) continue;
-            if (strtolower((string)wp_parse_url($next, PHP_URL_HOST)) !== $session['root_host']) continue;
-
-            $session['seen'][$identity] = true;
-            $session['scan_attempts']++;
-            $depth = $session['depth_map'][$next] ?? 0;
-
-            $fetch = $this->fetch_page($next);
-            if (is_wp_error($fetch)) {
-                $session['pages'][] = ['url' => $next, 'error' => $fetch->get_error_message(), 'depth' => $depth];
-                continue;
-            }
-
-            $parsed = $this->parse_page($next, $fetch['body'], $fetch['headers'] ?? []);
-            $parsed['depth'] = $depth;
-            $session['pages'][] = $parsed;
-
-            foreach ($parsed['links'] as $l) {
-                $linkId = $this->page_identity($l);
-                if (!isset($session['seen'][$linkId]) && count($session['queue']) < 30) {
-                    $session['queue'][] = $l;
-                    $session['depth_map'][$l] = $depth + 1;
-                }
-            }
-        }
-
-        return rest_ensure_response($this->compile_report($session));
-    }
-
-    /* -------------------------------------------------------------------------
-     * DIAGNOSTICS & REPORT COMPILER
-     * ---------------------------------------------------------------------- */
-
-    private function compile_report($session) {
-        $url       = $session['start_url'];
-        $pages     = $session['pages'];
-        $audits    = $session['audits'];
-        $scanLimit = $session['scan_limit'];
-        $scanAttempts = $session['scan_attempts'];
-
-        $issues  = [];
-        $summary = ['title_issues' => 0, 'description_issues' => 0];
-
-        $add = function($sev, $title, $detail, $page) use (&$issues) {
-            $title = (string)$title; $detail = (string)$detail; $page = (string)$page; $sev = (string)$sev;
-            $lowTitle = strtolower($title);
-
-            // Canonical 6 categories
-            $category = 'Technical SEO & Security';
-            if (strpos($lowTitle, 'pagespeed') !== false || strpos($lowTitle, 'speed') !== false || strpos($lowTitle, 'render-blocking') !== false || strpos($lowTitle, 'lighthouse') !== false || strpos($lowTitle, 'vitals') !== false) {
-                $category = 'PageSpeed & Core Web Vitals';
-            } elseif (strpos($lowTitle, 'security') !== false || strpos($lowTitle, 'hsts') !== false || strpos($lowTitle, 'header') !== false || strpos($lowTitle, 'mixed-content') !== false || strpos($lowTitle, 'reverse tabnabbing') !== false || strpos($lowTitle, 'clickjacking') !== false || strpos($lowTitle, 'mime sniffing') !== false || strpos($lowTitle, 'canonical') !== false || strpos($lowTitle, 'robots') !== false || strpos($lowTitle, 'sitemap') !== false || strpos($lowTitle, 'crawl depth') !== false || strpos($lowTitle, 'broken link') !== false || strpos($lowTitle, 'link redirect') !== false || strpos($lowTitle, 'url') !== false) {
-                $category = 'Technical SEO & Security';
-            } elseif (strpos($lowTitle, 'meta') !== false || strpos($lowTitle, 'title') !== false || strpos($lowTitle, 'heading') !== false || strpos($lowTitle, 'open graph') !== false || strpos($lowTitle, 'image') !== false || strpos($lowTitle, 'twitter') !== false || strpos($lowTitle, 'alt') !== false) {
-                $category = 'On-page SEO & Meta';
-            } elseif (strpos($lowTitle, 'ai seo') !== false || strpos($lowTitle, 'structured data') !== false || strpos($lowTitle, 'author') !== false || strpos($lowTitle, 'question') !== false || strpos($lowTitle, 'json-ld') !== false || strpos($lowTitle, 'schema') !== false) {
-                $category = 'AI Search Readiness';
-            } elseif (strpos($lowTitle, 'local seo') !== false || strpos($lowTitle, 'local') !== false) {
-                $category = 'Local SEO Signals';
-            } elseif (strpos($lowTitle, 'content') !== false || strpos($lowTitle, 'word count') !== false || strpos($lowTitle, 'breadcrumb') !== false) {
-                $category = 'Content Quality';
-            } else {
-                $category = 'Technical SEO & Security';
-            }
-
-            $recommendation = 'Review this finding and apply fixes that align with your site strategy.';
-            $suggestion = '';
-            if (strpos($lowTitle, 'missing page title') !== false) {
-                $recommendation = 'Add a descriptive title tag under 60 characters with your primary keyword.';
-                $suggestion = 'Title | Official Website';
-            } elseif (strpos($lowTitle, 'meta description') !== false) {
-                $recommendation = 'Craft an engaging meta description between 120 and 155 characters.';
-                $suggestion = 'Discover information, services, and clear solutions on this page.';
-            } elseif (strpos($lowTitle, 'hsts') !== false) {
-                $recommendation = 'Enable HTTP Strict Transport Security (HSTS) on your web server.';
-                $suggestion = 'Strict-Transport-Security: max-age=31536000; includeSubDomains; preload';
-            } elseif (strpos($lowTitle, 'clickjacking') !== false) {
-                $recommendation = 'Add X-Frame-Options or CSP frame-ancestors to prevent unauthorized embedding.';
-                $suggestion = 'X-Frame-Options: SAMEORIGIN';
-            } elseif (strpos($lowTitle, 'mime sniffing') !== false) {
-                $recommendation = 'Add X-Content-Type-Options: nosniff header.';
-                $suggestion = 'X-Content-Type-Options: nosniff';
-            } elseif (strpos($lowTitle, 'reverse tabnabbing') !== false) {
-                $recommendation = 'Add rel="noopener" to external links opening in new tabs.';
-                $suggestion = 'rel="noopener noreferrer"';
-            } elseif (strpos($lowTitle, 'broken link') !== false) {
-                $recommendation = 'Update or redirect the broken URL.';
-                $suggestion = 'Update href or set up a 301 redirect.';
-            }
-
-            $fingerprint = md5(strtolower($sev . '|' . $title . '|' . $detail . '|' . $page));
-            foreach ($issues as $existing) {
-                if (($existing['_fingerprint'] ?? '') === $fingerprint) return;
-            }
-
-            $priority = in_array(strtolower($sev), ['critical', 'high'], true) ? 'Urgent' :
-                        (in_array(strtolower($sev), ['medium', 'warning'], true) ? 'Prioritize' : 'Routine');
-
-            $issues[] = [
-                'issue_id'       => 'CTC-' . strtoupper(substr(md5($category . '|' . $title . '|' . $page . '|' . $detail), 0, 8)),
-                'category'       => $category,
-                'severity'       => $sev,
-                'priority'       => $priority,
-                'effort'         => (strpos($lowTitle, 'broken link') !== false || strpos($lowTitle, 'meta') !== false || strpos($lowTitle, 'empty') !== false) ? 'Quick fix' : 'Moderate effort',
-                'title'          => $title,
-                'detail'         => $detail,
-                'recommendation' => $recommendation,
-                'suggested_fix'  => $suggestion,
-                'page'           => $page,
-                '_fingerprint'   => $fingerprint,
-            ];
-        };
-
-        // Evaluate Page Diagnostics
-        foreach ($pages as $p) {
-            $next = $p['url'];
-            if (!empty($p['error'])) {
-                $add('Warning', 'Page could not be checked', $p['error'], $next);
-                continue;
-            }
-
-            $currentDepth = $p['depth'] ?? 0;
-            $urlPath = (string)wp_parse_url($next, PHP_URL_PATH);
-            if (strlen($next) > 100) {
-                $add('Review', 'Long URL length (' . strlen($next) . ' chars)', 'URLs longer than 100 characters can be difficult to read and share.', $next);
-            }
-            if (preg_match('/[A-Z]/', $urlPath)) {
-                $add('Review', 'Uppercase characters in URL path', 'URLs with uppercase letters can create duplicate content issues on case-sensitive servers. Keep URLs lowercase.', $next);
-            }
-            if (!empty(wp_parse_url($next, PHP_URL_QUERY))) {
-                $qStr = strtolower((string)wp_parse_url($next, PHP_URL_QUERY));
-                if (preg_match('/(session|phpsessid|sid|sort|filter|ref|order)=/i', $qStr)) {
-                    $add('Review', 'Dynamic query parameter detected', 'URL contains session or sorting query parameters. Ensure these are canonicalized to avoid duplicate indexing.', $next);
-                }
-            }
-
-            if ($currentDepth >= 3) {
-                $add('Review', 'Deep crawl depth (Depth ' . $currentDepth . ')', 'This page takes 3 or more clicks to reach from the start page. Bring key conversion pages closer to the homepage.', $next);
-            }
-
-            // Security & Headers
-            if (in_array('technical', $audits, true)) {
-                if (stripos($next, 'https://') === 0 && empty($p['hsts_present'])) {
-                    $add('Medium', 'HSTS security header missing', 'Strict-Transport-Security header was not detected.', $next);
-                }
-                if (empty($p['x_frame_options']) && empty($p['csp_present'])) {
-                    $add('Low', 'Clickjacking defense header missing', 'Neither X-Frame-Options nor CSP frame-ancestors was detected.', $next);
-                }
-                if (empty($p['nosniff_present'])) {
-                    $add('Low', 'MIME sniffing header missing', 'X-Content-Type-Options: nosniff header was not detected.', $next);
-                }
-                if ($p['external_unsafe_targets'] > 0) {
-                    $add('Low', 'External links missing rel="noopener"', $p['external_unsafe_targets'] . ' external target="_blank" link(s) lack rel="noopener". This protects against reverse tabnabbing.', $next);
-                }
-                if ($p['links_nofollow_internal'] > 0) {
-                    $add('Review', 'Internal links marked nofollow', $p['links_nofollow_internal'] . ' internal link(s) use rel="nofollow", which blocks PageRank distribution across your own site.', $next);
-                }
-                if ($p['empty_links'] > 0) {
-                    $add('Review', 'Empty or uninformative links detected', $p['empty_links'] . ' link(s) contain no text, image alt, or aria-label.', $next);
-                }
-            }
-
-            // Indexability Directives
-            if (!empty($p['x_robots_tag']) && stripos($p['x_robots_tag'], 'noindex') !== false) {
-                $add('High', 'X-Robots-Tag HTTP header noindex detected', 'The server returned an HTTP response header blocking indexing: X-Robots-Tag: ' . $p['x_robots_tag'], $next);
-            }
-            if (stripos($p['robots'], 'noindex') !== false && !empty($p['canonical'])) {
-                $add('High', 'Conflicting indexing directives (noindex + canonical)', 'Page declares noindex while also declaring a canonical tag. Remove noindex or verify intent.', $next);
-            }
-
-            // On-Page Checks
-            if (in_array('onpage', $audits, true)) {
-                if (!$p['title']) {
-                    $summary['title_issues']++;
-                    $add('High', 'Missing page title', 'The page does not declare a title tag.', $next);
-                } elseif (mb_strlen($p['title']) > 60) {
-                    $add('Review', 'Long page title (' . mb_strlen($p['title']) . ' chars)', 'Titles over 60 characters are often truncated in SERPs.', $next);
-                }
-
-                if (!$p['description']) {
-                    $summary['description_issues']++;
-                    $add('Medium', 'Missing meta description', 'Add a unique description to improve click-through rate.', $next);
-                } elseif (mb_strlen($p['description']) > 160) {
-                    $add('Review', 'Meta description too long (' . mb_strlen($p['description']) . ' chars)', 'Descriptions over 160 chars are often truncated.', $next);
-                }
-
-                if ($p['h1'] === 0) {
-                    $add('Medium', 'No H1 heading detected', 'Add a primary H1 heading to identify the page topic.', $next);
-                } elseif ($p['h1'] > 1) {
-                    $add('Review', 'Multiple H1 headings (' . $p['h1'] . ')', 'Verify that having multiple H1s matches your outline.', $next);
-                }
-
-                if (!empty($p['skipped_headings']) && $p['skipped_headings'] > 0) {
-                    $add('Review', 'Skipped heading hierarchy', 'Detected ' . $p['skipped_headings'] . ' skipped heading levels (e.g., H1 jumping to H3).', $next);
-                }
-                if (!empty($p['empty_headings']) && $p['empty_headings'] > 0) {
-                    $add('Review', 'Empty heading tags detected', 'Found ' . $p['empty_headings'] . ' heading tag(s) with no text content. Clean up empty heading tags in page builders.', $next);
-                }
-
-                if ($p['missing_alt'] > 0) {
-                    $add('Medium', 'Images missing alt text', $p['missing_alt'] . ' image(s) have empty or missing alt attributes.', $next);
-                }
-                if ($p['missing_image_dims'] > 0) {
-                    $add('Low', 'Images missing width/height attributes', $p['missing_image_dims'] . ' image(s) lack explicit dimensions, which can increase layout shifts (CLS).', $next);
-                }
-                if ($p['legacy_image_formats'] > 3) {
-                    $add('Info', 'Legacy image formats detected', $p['legacy_image_formats'] . ' image(s) use PNG/JPG. Consider converting to WebP or AVIF for faster load times.', $next);
-                }
-
-                if (empty($p['og_title_present']) || empty($p['og_image_present'])) {
-                    $add('Low', 'Open Graph social preview tags incomplete', 'Page is missing og:title or og:image tags for social sharing previews.', $next);
-                }
-                if (empty($p['twitter_card_present'])) {
-                    $add('Low', 'Twitter Card metadata missing', 'Add twitter:card, twitter:title, and twitter:image for rich snippets on X / Twitter.', $next);
-                }
-
-                // Generic anchor text check
-                if (!empty($p['link_details'])) {
-                    $generic = [];
-                    foreach ($p['link_details'] as $ld) {
-                        $anc = mb_strtolower(trim($ld['anchor'] ?? ''));
-                        if (in_array($anc, ['click here', 'read more', 'learn more', 'here', 'link', 'more'], true)) {
-                            $generic[] = $anc;
-                        }
-                    }
-                    if (count($generic) >= 2) {
-                        $add('Review', 'Generic link anchor text detected', 'Found ' . count($generic) . ' generic anchor(s) like "' . implode('", "', array_slice(array_unique($generic), 0, 3)) . '". Descriptive anchor text improves SEO and accessibility.', $next);
-                    }
-                }
-            }
-
-            // Technical SEO
-            if (in_array('technical', $audits, true)) {
-                if ($p['canonical_missing']) {
-                    $add('Review', 'Canonical link not detected', 'No canonical link tag was found.', $next);
-                }
-                if ($p['canonical_external']) {
-                    $add('High', 'Canonical points to an external domain', 'Canonical href points to: ' . $p['canonical'], $next);
-                }
-                if (!empty($p['header_canonical'])) {
-                    $add('Info', 'HTTP Link Header Canonical detected', 'Canonical declared via HTTP response header: ' . $p['header_canonical'], $next);
-                }
-                if (!empty($p['mixed_content'])) {
-                    $add('High', 'Mixed-content references detected', 'Detected ' . count($p['mixed_content']) . ' insecure HTTP resource(s) on HTTPS.', $next);
-                }
-                if (!$p['viewport_responsive']) {
-                    $add('Review', 'Responsive viewport not detected', 'Page does not declare standard mobile viewport width=device-width.', $next);
-                }
-            }
-
-            // Content Quality
-            if (in_array('content', $audits, true)) {
-                if ($p['word_count'] < 200) {
-                    $add('Review', 'Thin content / low word count (' . $p['word_count'] . ' words)', 'The page contains fewer than 200 words of body text. Ensure primary search intent is well covered.', $next);
-                }
-                if (!$p['breadcrumbs_present']) {
-                    $add('Review', 'Breadcrumb navigation missing', 'No breadcrumb schema or navigation found. Breadcrumbs help bots and users understand site hierarchy.', $next);
-                }
-            }
-
-            // AI Search Readiness (GEO / AEO)
-            if (in_array('ai', $audits, true)) {
-                if ($p['jsonld_invalid'] > 0) {
-                    $add('High', 'Malformed JSON-LD structured data syntax', 'Detected ' . $p['jsonld_invalid'] . ' JSON-LD block(s) with invalid JSON syntax.', $next);
-                } elseif (empty($p['jsonld_blocks'])) {
-                    $add('Review', 'Structured data (JSON-LD) missing', 'No schema JSON-LD blocks found. Machine-readable entities help AI search engines cite your content.', $next);
-                } else {
-                    $add('Info', 'Structured Data Entities: ' . implode(', ', array_slice($p['jsonld_types'], 0, 4)), 'Page declares valid Schema.org entities.', $next);
-                }
-
-                if ($p['question_headings'] === 0) {
-                    $add('Info', 'No question-led headings found (AI Search hint)', 'AI search engines (Perplexity, ChatGPT, AI Overviews) favor FAQ/question-led headers followed by direct answers.', $next);
-                }
-                if (!$p['author_byline_present']) {
-                    $add('Info', 'Author byline / E-E-A-T attribution missing', 'No author byline or Person schema detected. Author attribution strengthens E-E-A-T credibility.', $next);
-                }
-            }
-
-            // Performance: Head scripts
-            if (in_array('speed', $audits, true)) {
-                if ($p['render_blocking_scripts'] > 2) {
-                    $add('Medium', 'Render-blocking scripts in <head>', 'Found ' . $p['render_blocking_scripts'] . ' script(s) in <head> without defer or async attributes.', $next);
-                }
-            }
-        }
-
-        // Bounded Broken Link Checking (Sample max 6 links)
-        if (in_array('technical', $audits, true)) {
-            $destinations = [];
-            foreach ($pages as $pg) {
-                foreach (($pg['link_details'] ?? []) as $ld) {
-                    $dest = $ld['url'];
-                    if (!isset($destinations[$dest])) $destinations[$dest] = $ld;
-                }
-            }
-
-            $checked = 0;
-            foreach ($destinations as $dest => $ld) {
-                if ($checked >= 6) break;
-                $checked++;
-                $st = $this->check_link_status($dest);
-                if (is_wp_error($st)) continue;
-                $code = (int)($st['status'] ?? 0);
-                if ($code === 404 || $code === 410) {
-                    $add('Medium', 'Broken link detected (HTTP ' . $code . ')', 'Destination returned HTTP ' . $code . ': ' . $dest, $ld['source'] ?? $url);
-                } elseif (!empty($st['redirected'])) {
-                    $add('Review', 'Link redirects', 'Destination redirects to: ' . $st['final_url'], $ld['source'] ?? $url);
-                }
-            }
-        }
-
-        // Robots.txt & Sitemap
-        if (in_array('technical', $audits, true)) {
-            $origin = wp_parse_url($url, PHP_URL_SCHEME) . '://' . wp_parse_url($url, PHP_URL_HOST);
-            $robots = $this->fetch_text_resource($origin . '/robots.txt', 50000);
-            if (is_wp_error($robots)) {
-                $add('Review', 'robots.txt could not be fetched', $robots->get_error_message(), $origin . '/robots.txt');
-            } else {
-                $sitemapFound = false;
-                if (preg_match('/^\s*Sitemap:\s*(https?:\/\/\S+)/im', $robots['body'], $sm)) {
-                    $sitemapFound = true;
-                    $add('Info', 'XML Sitemap listed in robots.txt', 'Detected: ' . trim($sm[1]), $origin . '/robots.txt');
-                }
-                if (!$sitemapFound) {
-                    $common = [$origin . '/sitemap_index.xml', $origin . '/wp-sitemap.xml'];
-                    foreach ($common as $candidate) {
-                        $test = $this->fetch_text_resource($candidate, 30000);
-                        if (!is_wp_error($test) && (stripos($test['body'], '<urlset') !== false || stripos($test['body'], '<sitemapindex') !== false)) {
-                            $sitemapFound = true;
-                            $add('Info', 'XML Sitemap detected', 'Detected: ' . $candidate, $candidate);
-                            break;
-                        }
-                    }
-                }
-                if (!$sitemapFound) {
-                    $add('Medium', 'No XML Sitemap detected', 'No sitemap found in robots.txt or standard paths.', $url);
-                }
-            }
-        }
-
-        // Google PageSpeed API (if key is set)
-        $psiKey = get_option(self::OPT_PSI_KEY, '');
-        if (in_array('speed', $audits, true) && !empty($psiKey)) {
-            $api = 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=' . rawurlencode($url) . '&strategy=mobile&category=performance&category=seo&key=' . rawurlencode($psiKey);
-            $pr = $this->safe_remote_get($api, ['timeout' => 6, 'headers' => ['Accept' => 'application/json']]);
-            if (!is_wp_error($pr) && ($pr['response']['code'] ?? 0) === 200) {
-                $j = json_decode($pr['body'], true);
-                $perf = $j['lighthouseResult']['categories']['performance']['score'] ?? null;
-                $auds = $j['lighthouseResult']['audits'] ?? [];
-                $lcp  = $auds['largest-contentful-paint']['displayValue'] ?? 'N/A';
-                $cls  = $auds['cumulative-layout-shift']['displayValue'] ?? 'N/A';
-                $add('Info', 'Google PageSpeed Insights (Mobile)', 'Performance: ' . ($perf !== null ? round($perf * 100) : 'N/A') . '/100. Core Web Vitals: LCP: ' . $lcp . ', CLS: ' . $cls, $url);
-            }
-        }
-
-        // Calculate Scores
-        $weights = ['critical' => 10, 'high' => 5, 'medium' => 2.5, 'low' => 0.5, 'warning' => 1.0, 'review' => 1.0, 'info' => 0];
-        $severityCounts = ['Critical' => 0, 'High' => 0, 'Medium' => 0, 'Low' => 0, 'Review' => 0, 'Warning' => 0, 'Info' => 0];
-        $categoryCounts = [];
-        $rawDeductions = 0;
-        $categoryDeductions = [];
-        $deduped = [];
-        $seenSig = [];
-
-        foreach ($issues as $issue) {
-            $sev = $issue['severity'] ?? 'Info';
-            $cat = $issue['category'] ?? 'General';
-            $sig = md5(strtolower($cat . '|' . $issue['title'] . '|' . ($issue['page'] ?? '')));
-            if (isset($seenSig[$sig])) continue;
-            $seenSig[$sig] = true;
-            unset($issue['_fingerprint']);
-            $deduped[] = $issue;
-
-            $severityCounts[$sev] = ($severityCounts[$sev] ?? 0) + 1;
-            $categoryCounts[$cat] = ($categoryCounts[$cat] ?? 0) + 1;
-            $w = $weights[strtolower($sev)] ?? 0;
-            $rawDeductions += $w;
-            $categoryDeductions[$cat] = ($categoryDeductions[$cat] ?? 0) + $w;
-        }
-
-        $pageCount = max(1, count($pages));
-        $deductions = min(100, $rawDeductions / $pageCount);
-        $finalScore = (int)round(max(0, 100 - $deductions));
-
-        $categoryScores = [];
-        $allCategories = ['Technical SEO & Security', 'On-page SEO & Meta', 'Content Quality', 'AI Search Readiness', 'Local SEO Signals', 'PageSpeed & Core Web Vitals'];
-        foreach ($allCategories as $cName) {
-            $cPen = min(100, ($categoryDeductions[$cName] ?? 0) / $pageCount);
-            $categoryScores[$cName] = round(max(0, 100 - $cPen), 1);
-        }
-
-        $report = [
-            'url'             => $url,
-            'pages_checked'   => count($pages),
-            'pages_attempted' => $scanAttempts,
-            'scan_limit'      => $scanLimit,
-            'pages'           => $pages,
-            'issues'          => $deduped,
-            'score'           => $finalScore,
-            'brand'           => [
-                'name'  => get_option(self::OPT_BRAND_NAME, 'Creative Tech Coderz'),
-                'logo'  => get_option(self::OPT_BRAND_LOGO, 'https://creativetechcoderz.com/wp-content/uploads/2026/10/cropped-creative-tech-coderz-logo-transparent-2.png'),
-                'email' => get_option(self::OPT_CONTACT_EMAIL, get_option('admin_email')),
-            ],
-            'summary'         => array_merge($summary, [
-                'by_severity'     => $severityCounts,
-                'by_category'     => $categoryCounts,
-                'category_scores' => $categoryScores,
-                'score_deductions'=> round($deductions, 2),
-            ]),
-            'generated_at'    => current_time('c'),
-        ];
-
-        // Save History (Max 15 items, lightweight)
-        $history = get_option(self::OPT_SCAN_HISTORY, []);
-        if (!is_array($history)) $history = [];
-        array_unshift($history, [
-            'date'   => current_time('mysql'),
-            'url'    => $url,
-            'pages'  => count($pages),
-            'score'  => $finalScore,
-            'issues' => count($deduped),
-        ]);
-        update_option(self::OPT_SCAN_HISTORY, array_slice($history, 0, 15), false);
-
-        return $report;
-    }
-
-    public function submit_large_audit_request($req) {
-        $name     = sanitize_text_field((string)$req->get_param('name'));
-        $email    = sanitize_email((string)$req->get_param('email'));
-        $url      = esc_url_raw(trim((string)$req->get_param('url')));
-        $honeypot = trim((string)$req->get_param('company'));
-
-        if ($honeypot !== '') {
-            return rest_ensure_response(['submitted' => true, 'message' => 'Thank you. Your request has been received.']);
-        }
-        if ($name === '' || !is_email($email) || !$url || !wp_http_validate_url($url)) {
-            return new WP_Error('invalid_request', 'Please provide a valid name, email address, and public website URL.', ['status' => 400]);
-        }
-
-        $to      = get_option(self::OPT_CONTACT_EMAIL, get_option('admin_email'));
-        $subject = 'New Audit Request (21–500 pages): ' . $url;
-        $message = "New large website audit request received:\n\nName: {$name}\nEmail: {$email}\nWebsite: {$url}\nSubmitted: " . current_time('mysql');
-        $headers = ['Reply-To: ' . $name . ' <' . $email . '>'];
-
-        wp_mail($to, $subject, $message, $headers);
-        wp_mail($email, 'Audit Request Received - ' . get_option(self::OPT_BRAND_NAME, 'Creative Tech Coderz'), "Hello {$name},\n\nWe have received your audit request for {$url}. Our team will review and follow up shortly.\n\nBest regards,\n" . get_option(self::OPT_BRAND_NAME, 'Creative Tech Coderz'));
-
-        return rest_ensure_response(['submitted' => true, 'message' => 'Your request was received successfully! We will follow up via email.']);
-    }
-
-    public function shortcode() {
-        $initEndpoint     = esc_url(rest_url('ctc-audit/v1/scan/init'));
-        $batchEndpoint    = esc_url(rest_url('ctc-audit/v1/scan/batch'));
-        $finalizeEndpoint = esc_url(rest_url('ctc-audit/v1/scan/finalize'));
-        $largeEndpoint    = esc_url(rest_url('ctc-audit/v1/large-audit-request'));
-        $restNonce        = wp_create_nonce('wp_rest');
-
-        ob_start(); ?>
-        <style>
-        .ctca { max-width: 1100px; margin: 30px auto; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
-        .ctca-hero { background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%); color: #fff; border-radius: 18px; padding: clamp(24px, 4vw, 42px); margin-bottom: 24px; box-shadow: 0 12px 35px rgba(15, 23, 42, 0.12); }
-        .ctca-hero h2 { color: #fff; font-size: clamp(24px, 3.5vw, 36px); line-height: 1.25; margin: 0 0 10px; font-weight: 800; }
-        .ctca-hero p { color: #cbd5e1; max-width: 720px; font-size: 15px; margin: 0; line-height: 1.6; }
-        .ctca-form, .ctca-results { background: #fff; border: 1px solid #e2e8f0; border-radius: 18px; padding: clamp(20px, 3.5vw, 36px); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.05); }
-        .ctca label { font-weight: 600; display: block; margin-bottom: 7px; color: #1e293b; font-size: 14px; }
-        .ctca input[type=url], .ctca select, .ctca input[type=text], .ctca input[type=email] { width: 100%; box-sizing: border-box; padding: 13px 16px; border: 1px solid #cbd5e1; border-radius: 10px; font-size: 15px; color: #0f172a; background: #fff; transition: border-color .15s, box-shadow .15s; }
-        .ctca input[type=url]:focus, .ctca select:focus, .ctca input[type=text]:focus, .ctca input[type=email]:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15); }
-        .ctca-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 18px 0; }
-        .ctca-option { border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px; display: flex; gap: 10px; align-items: center; background: #f8fafc; cursor: pointer; font-size: 14px; font-weight: 500; transition: border-color .15s, background .15s; }
-        .ctca-option:hover { background: #f1f5f9; border-color: #cbd5e1; }
-        .ctca-option input[type=checkbox] { width: 17px; height: 17px; accent-color: #2563eb; cursor: pointer; }
-        .ctca button.ctca-btn { background: #2563eb; color: #fff; border: 0; border-radius: 10px; padding: 13px 26px; font-weight: 700; font-size: 15px; cursor: pointer; transition: background .15s, transform .1s; display: inline-flex; align-items: center; gap: 8px; }
-        .ctca button.ctca-btn:hover { background: #1d4ed8; }
-        .ctca button.ctca-btn:disabled { opacity: .65; cursor: wait; }
-        .ctca .ctca-results > div[style*="border-top"] {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: stretch;
-            gap: 10px;
-        }
-        .ctca .ctca-results > div[style*="border-top"] .ctca-btn {
-            box-sizing: border-box;
-            max-width: 100%;
-            white-space: normal;
-            overflow-wrap: anywhere;
-        }
-        @media (max-width: 600px) {
-            .ctca .ctca-results > div[style*="border-top"] {
-                flex-direction: column;
-                align-items: stretch;
-            }
-            .ctca .ctca-results > div[style*="border-top"] .ctca-btn {
-                width: 100%;
-                min-width: 0;
-                margin: 0;
-                text-align: center;
-            }
-        }
-        .ctca-muted { color: #64748b; font-size: 13px; line-height: 1.5; margin: 8px 0; }
-        
-        /* Progress Bar */
-        .ctca-progress-box { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 14px; padding: 20px; margin-top: 18px; }
-        .ctca-progress-bar { height: 10px; background: #e2e8f0; border-radius: 6px; overflow: hidden; margin-top: 10px; }
-        .ctca-progress-fill { height: 100%; width: 0%; background: #2563eb; transition: width 0.3s ease; }
-
-        /* Modern Result Cards */
-        .ctca-result-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 18px 0; }
-        .ctca-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 16px 18px; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03); }
-        .ctca-card strong { display: block; font-size: 26px; margin: 6px 0 2px; color: #0f172a; font-weight: 800; }
-        
-        /* Interactive Category Cards / Pills */
-        .ctca-cat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin: 18px 0; }
-        .ctca-cat-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 16px 18px; cursor: pointer; text-align: left; transition: all .18s ease; outline: none; position: relative; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03); }
-        .ctca-cat-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08); border-color: #cbd5e1; }
-        .ctca-cat-card.active { border-color: #2563eb !important; background: #f8fafc !important; box-shadow: 0 0 0 2px #2563eb, 0 8px 20px rgba(37, 99, 235, 0.12) !important; }
-        .ctca-cat-card .ctca-cat-name { font-size: 13px; font-weight: 700; color: #475569; display: block; }
-        .ctca-cat-card strong { display: block; font-size: 22px; margin: 6px 0 3px; color: #0f172a; font-weight: 800; }
-        .ctca-cat-card .ctca-cat-sub { font-size: 12px; color: #64748b; display: block; }
-        .ctca-cat-badge { position: absolute; top: 14px; right: 14px; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 20px; background: #e2e8f0; color: #334155; }
-        .ctca-cat-card.active .ctca-cat-badge { background: #2563eb; color: #fff; }
-
-        /* Finding Item Cards */
-        .ctca-issue { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 20px; margin: 14px 0; box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04); transition: border-color .15s; }
-        .ctca-issue:hover { border-color: #cbd5e1; }
-        .ctca-badge { display: inline-block; border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; margin-right: 8px; }
-        .ctca-issue[data-severity="Critical"] .ctca-badge, .ctca-issue[data-severity="High"] .ctca-badge { background: #fee2e2; color: #b91c1c; }
-        .ctca-issue[data-severity="Medium"] .ctca-badge, .ctca-issue[data-severity="Warning"] .ctca-badge { background: #fef3c7; color: #b45309; }
-        .ctca-issue[data-severity="Low"] .ctca-badge, .ctca-issue[data-severity="Info"] .ctca-badge { background: #dcfce7; color: #15803d; }
-        .ctca-issue[data-severity="Review"] .ctca-badge { background: #e0f2fe; color: #0369a1; }
-        
-        .ctca-recommendation-box { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 12px 16px; margin: 12px 0 8px; font-size: 14px; color: #166534; line-height: 1.5; }
-        .ctca-suggestion-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 16px; margin: 10px 0 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: #0f172a; position: relative; overflow-x: auto; }
-        .ctca-copy-btn { float: right; background: #334155; color: #fff; border: 0; border-radius: 6px; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer; margin-left: 8px; }
-        .ctca-copy-btn:hover { background: #1e293b; }
-        
-        /* Print & PDF */
-        .ctca-print-brand { display: none; }
-        @media print {
-            body * { visibility: hidden; }
-            .ctca-results, .ctca-results * { visibility: visible; }
-            .ctca-results { position: absolute; left: 0; top: 0; width: 100%; border: 0; box-shadow: none; padding: 0; }
-            .ctca-hero, .ctca-form, .ctca-filters, button, .ctca-cat-grid { display: none !important; }
-            .ctca-print-brand { display: flex !important; align-items: center; gap: 16px; border-bottom: 2px solid #2563eb; padding-bottom: 12px; margin-bottom: 16px; }
-            .ctca-print-brand img { max-height: 48px; }
-            .ctca-issue { break-inside: avoid; page-break-inside: avoid; }
-        }
-        </style>
-
-        <div class="ctca">
-            <section class="ctca-hero">
-                <p style="color:#60a5fa;font-weight:700;text-transform:uppercase;margin:0 0 6px;font-size:12px;letter-spacing:0.05em;">Professional SEO & Technical Health Checker</p>
-                <h2>Find the issues holding your website back.</h2>
-                <p>Scan key pages for technical SEO, security headers, on-page structure, image optimization, broken links, AI search readiness, and mobile responsiveness.</p>
-            </section>
-
-            <form class="ctca-form" id="ctca-form">
-                <label for="ctca-url">Target Website URL</label>
-                <input id="ctca-url" type="url" placeholder="https://example.com" required>
-                <p class="ctca-muted">Enter any public HTTP or HTTPS website URL you wish to audit.</p>
-
-                <label for="ctca-scan-limit" style="margin-top:16px;">Pages to audit</label>
-                <select id="ctca-scan-limit">
-                    <option value="1">Single page — 1 page</option>
-                    <option value="5" selected>Fast scan — 5 pages</option>
+    if(in_array('ai',$audits,true))$add('Info','AI SEO / GEO / AEO checks are limited','Checks cover accessible HTML signals, extractable text and structured-data presence only. AI citations, model answers and visibility across ChatGPT, Gemini, Perplexity and Google AI Overviews are not measured.',$url);
+    if(in_array('local',$audits,true))$add('Info','Local SEO checks require external verification','This scan cannot verify Google Business Profile ownership, map-pack rankings, NAP consistency across directories or live citation databases. Validate these separately.',$url);
+    
+    // Transparent heuristic score: per-page normalized penalties prevent a site with several checked pages from hitting zero solely because raw finding counts accumulate. This is not a Google ranking score.
+    $weights=['critical'=>10,'high'=>5,'medium'=>2,'low'=>0.5,'warning'=>0.5,'review'=>1,'info'=>0.25];
+    $severityCounts=['Critical'=>0,'High'=>0,'Medium'=>0,'Low'=>0,'Review'=>0,'Warning'=>0,'Info'=>0];$categoryCounts=[];$rawDeductions=0;$categoryDeductions=[];$scored=[];$deduped=[];
+    foreach($issues as $issue){$sev=(string)($issue['severity']??'Info');$cat=(string)($issue['category']??'General');$signatureDetail=(string)($issue['detail']??'');$signatureTitle=(string)($issue['title']??'');$signatureIdentity='';if(preg_match('/(?:Destination|Original destination):\s*(https?:\/\/[^\s;]+)/i',$signatureDetail,$destinationMatch)){$signatureIdentity=strtolower(rtrim($destinationMatch[1],'. ,;'));}$signature=md5(strtolower($cat.'|'.$signatureTitle.'|'.($issue['page']??'').'|'.$signatureIdentity));if(isset($scored[$signature]))continue;$scored[$signature]=true;unset($issue['_fingerprint']);$deduped[]=$issue;$severityCounts[$sev]=($severityCounts[$sev]??0)+1;$categoryCounts[$cat]=($categoryCounts[$cat]??0)+1;$weight=$weights[strtolower($sev)]??0;$rawDeductions+=$weight;$categoryDeductions[$cat]=($categoryDeductions[$cat]??0)+$weight;}
+    $issues=$deduped;$pageDenominator=max(1,count($pages));$deductions=min(100,$rawDeductions/$pageDenominator);$score=(int)round(max(0,100-$deductions));$categoryScores=[];$categoryPenalty=[];$allCategories=['Technical SEO','On-page SEO','AI SEO / GEO / AEO','Local SEO','Content quality signals','Website speed'];foreach($allCategories as $catName){$penalty=min(100,($categoryDeductions[$catName]??0)/$pageDenominator);$categoryPenalty[$catName]=round($penalty,2);$categoryKeyMap=['Technical SEO'=>'technical','On-page SEO'=>'onpage','AI SEO / GEO / AEO'=>'ai','Local SEO'=>'local','Content quality signals'=>'content','Website speed'=>'speed'];$categoryScores[$catName]=in_array($categoryKeyMap[$catName]??'', $audits, true) ? round(max(0,100-$penalty),1) : null;}
+    $result=['url'=>$url,'pages_checked'=>count($pages),'pages_attempted'=>$scanAttempts,'scan_limit'=>$scanLimit,'requested_scan_limit'=>$requestedLimit,'pages'=>$pages,'issues'=>$issues,'summary'=>array_merge($summary,['by_severity'=>$severityCounts,'by_category'=>$categoryCounts,'category_scores'=>$categoryScores,'category_penalty_points'=>$categoryPenalty,'finding_count'=>count($issues),'score_method'=>'Weighted per-page heuristic v3','score_deductions'=>round($deductions,2),'raw_weight_total'=>round($rawDeductions,2),'score_normalization_pages'=>$pageDenominator,'score_breakdown'=>['Critical'=>10,'High'=>5,'Medium'=>2,'Low'=>0.5,'Warning'=>0.5,'Review'=>1,'Info'=>0.25]]),'score'=>$score,'score_label'=>'Weighted heuristic audit score (not a search-engine score)','generated_at'=>current_time('c'),'notice'=>'Score is a per-page-normalized triage indicator, not a Google ranking metric. Weights: Critical 10, High 5, Medium 2, Low/Warning 0.5, Review 1, Info 0.25. Identical findings on the same page and category are counted once. Checks that did not run should be reported as unavailable, not failed. Scores are directional and should be reviewed alongside findings and coverage.' ];
+    $history=get_option('ctc_website_audit_history',[]);if(!is_array($history))$history=[];$fingerprints=[];$highFindings=[];foreach($issues as $hi){$fid=$hi['issue_id']??md5(($hi['title']??'').'|'.($hi['page']??''));$fingerprints[]=$fid;if(in_array(strtolower((string)($hi['severity']??'')),['critical','high'],true))$highFindings[$fid]=($hi['title']??'Finding').' — '.($hi['page']??$url);}
+    $previousForUrl=null;foreach($history as $old){if(strtolower((string)($old['url']??''))===strtolower($url)){$previousForUrl=$old;break;}}
+    if($scheduled && $previousForUrl && !empty($highFindings)){$oldIds=(array)($previousForUrl['issue_ids']??[]);$new=[];foreach($highFindings as $fid=>$label)if(!in_array($fid,$oldIds,true))$new[]=$label;if($new){$to=get_option('admin_email');$subject='CTC Website Audit: new high-priority findings';$body="The scheduled audit detected new high-priority findings on {$url}:\n\n- ".implode("\n- ",$new)."\n\nReview the website audit report in WordPress. This message is based on automated signals and may require manual confirmation.";if(!wp_mail($to,$subject,$body)){$monitorState=get_option(self::MONITOR_STATE_OPT,[]);if(!is_array($monitorState))$monitorState=[];$monitorState['last_alert_status']='failed';$monitorState['last_alert_message']='wp_mail() did not confirm delivery; verify WordPress mail configuration.';$monitorState['last_alert_at']=current_time('mysql');update_option(self::MONITOR_STATE_OPT,$monitorState,false);}else{$monitorState=get_option(self::MONITOR_STATE_OPT,[]);if(!is_array($monitorState))$monitorState=[];$monitorState['last_alert_status']='submitted';$monitorState['last_alert_message']='Alert handed to WordPress mail transport; inbox delivery is not confirmed.';$monitorState['last_alert_at']=current_time('mysql');update_option(self::MONITOR_STATE_OPT,$monitorState,false);}}}
+    array_unshift($history,['date'=>current_time('mysql'),'url'=>$url,'pages'=>count($pages),'score'=>$score,'issues'=>count($issues),'issue_ids'=>array_values(array_unique($fingerprints)),'audits'=>$audits]);update_option('ctc_website_audit_history',array_slice($history,0,50),false);return rest_ensure_response($result);}
+}
+new CTC_Website_Audit();
