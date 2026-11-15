@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CTC Website Audit Pro
  * Description: High-performance, secure website audit tool by Creative Tech Coderz. Features progressive batch crawling, SSRF protection, strict TLS verification, technical SEO, on-page structure, security headers, schema validation, CSV export, and branded print/PDF reports.
- * Version: 3.8.1
+ * Version: 3.8.2
  * Author: Creative Tech Coderz
  * Author URI: https://creativetechcoderz.com
  * Requires at least: 6.2
@@ -18,7 +18,7 @@ if (defined('CTC_WEBSITE_AUDIT_PRO_LOADED')) {
     return;
 }
 define('CTC_WEBSITE_AUDIT_PRO_LOADED', true);
-define('CTC_AUDIT_VERSION', '3.8.1');
+define('CTC_AUDIT_VERSION', '3.8.2');
 
 class CTC_Website_Audit {
 
