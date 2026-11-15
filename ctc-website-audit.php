@@ -1371,6 +1371,75 @@ class CTC_Website_Audit {
         
         /* Print & PDF */
         .ctca-print-brand { display: none; }
+        /* Branded report header: compact on screen and in exported PDFs */
+        .ctca-results .ctca-print-brand {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: flex-start !important;
+            gap: 18px !important;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0 0 18px;
+            margin: 0 0 20px;
+            border-bottom: 2px solid #2563eb;
+        }
+        .ctca-results .ctca-print-brand img {
+            display: block !important;
+            width: auto !important;
+            max-width: 210px !important;
+            height: auto !important;
+            max-height: 64px !important;
+            object-fit: contain !important;
+            flex: 0 0 auto;
+        }
+        .ctca-results .ctca-print-brand h3 {
+            margin: 0 !important;
+            color: #0f172a;
+            font-size: 20px;
+            line-height: 1.25;
+            font-weight: 800;
+        }
+        .ctca-results .ctca-print-brand p { margin: 3px 0 0 !important; }
+        .ctca-results .ctca-result-grid {
+            display: grid !important;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)) !important;
+            gap: 12px !important;
+            margin: 20px 0 !important;
+            align-items: stretch;
+        }
+        .ctca-results .ctca-card {
+            min-width: 0;
+            box-sizing: border-box;
+            padding: 16px !important;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            background: #fff;
+        }
+        .ctca-results .ctca-card strong { font-size: 25px; line-height: 1.2; }
+        .ctca-results .ctca-report-actions {
+            display: flex !important;
+            flex-wrap: wrap !important;
+            align-items: center !important;
+            gap: 10px !important;
+            margin: 18px 0 26px !important;
+        }
+        .ctca-results .ctca-report-actions .ctca-btn {
+            display: inline-flex !important;
+            align-items: center;
+            justify-content: center;
+            width: auto !important;
+            min-width: 190px;
+            max-width: 100%;
+            box-sizing: border-box;
+            white-space: normal;
+        }
+        @media (max-width: 640px) {
+            .ctca-results .ctca-print-brand { gap: 12px !important; }
+            .ctca-results .ctca-print-brand img { max-width: 125px !important; max-height: 48px !important; }
+            .ctca-results .ctca-result-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+            .ctca-results .ctca-report-actions { flex-direction: column; align-items: stretch !important; }
+            .ctca-results .ctca-report-actions .ctca-btn { width: 100% !important; min-width: 0; }
+        }
         @media print {
             body * { visibility: hidden; }
             .ctca-results, .ctca-results * { visibility: visible; }
@@ -1596,7 +1665,7 @@ class CTC_Website_Audit {
 
                 let html = `
                     <div class="ctca-print-brand">
-                        <img src="${esc(data.brand.logo)}" alt="${esc(data.brand.name)}">
+                        <img src="${esc(data.brand.logo)}" alt="${esc(data.brand.name)}" style="display:block;width:auto!important;max-width:210px!important;height:auto!important;max-height:64px!important;object-fit:contain!important;">
                         <div>
                             <h3 style="margin:0;">${esc(data.brand.name)}</h3>
                             <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Website Audit Report</p>
@@ -1607,7 +1676,7 @@ class CTC_Website_Audit {
                     <p class="ctca-muted" style="margin-top:0;"><strong>Website:</strong> <a href="${esc(data.url)}" target="_blank" rel="noopener">${esc(data.url)}</a> · <strong>Pages checked:</strong> ${data.pages_checked} · Generated: ${esc(data.generated_at)}</p>
 
                     <!-- Score and Quick Metrics -->
-                    <div class="ctca-result-grid">
+                    <div class="ctca-result-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:20px 0;">
                         <div class="ctca-card" style="border-left:4px solid #2563eb;">
                             <span class="ctca-muted" style="font-weight:600;">Overall Health Score</span>
                             <strong style="color:#2563eb;">${data.score}/100</strong>
@@ -1636,7 +1705,7 @@ class CTC_Website_Audit {
                     </div>
 
                     <!-- Top Action Bar -->
-                    <div style="display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 24px;align-items:center;">
+                    <div class="ctca-report-actions" style="display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 26px;align-items:center;">
                         <button type="button" class="ctca-btn ctca-csv-trigger" style="background:#0f172a;padding:10px 18px;font-size:14px;">📥 Download CSV Report</button>
                         <button type="button" onclick="window.print()" class="ctca-btn" style="background:#475569;padding:10px 18px;font-size:14px;">🖨️ Print / Save PDF</button>
                     </div>
